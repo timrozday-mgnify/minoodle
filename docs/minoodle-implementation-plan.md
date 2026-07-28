@@ -1,4 +1,4 @@
-# minoodle — implementation plan (rev 7)
+# minoodle — implementation plan (rev 8)
 
 Probabilistic sampling of sequences from a metagenome assembly graph, as an alternative to
 rules-based consensus assembly.
@@ -9,6 +9,11 @@ the findings from the run. M4 — likelihood terms, one at a time — is next.
 Note M1's finding 1: the §2.3 prior is implemented as the normalised per-base geometric.
 Note M2's finding 1: the `TV < 0.01` gate is restated against an exact-iid reference band.
 Note M3's finding 1: `metaspades.py -k 21` gives `21M` overlaps, so k = 22 in this codebase.
+**Changes in rev 8:** M3 recorded as done, with its five findings — chief among them that
+`-k 21` means k = 22 here; D17 added (external tools run in containers); §5.5.4's environment
+paragraph now names the mechanism.
+**Changes in rev 7:** M5 split into M5a/M5b with optimisation between them (D16); §5.5.4 HPC
+execution discipline added.
 **Changes in rev 6:** candidate R2 accessions recorded; §5.5.2c verification protocol added.
 **Changes in rev 5:** D11-D13 resolved; §5.5.2a (R2 in-scope set) and §5.5.2b
 (reference verification) added; D14-D15 opened.
