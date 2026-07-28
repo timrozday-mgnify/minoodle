@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "minoodle"
+version = "0.0.1"
+description = "Probabilistic sampling of sequences from a metagenome assembly graph"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+    "numba",
+    "pyyaml",
+    "pyarrow",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "hypothesis", "ruff"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["minoodle"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

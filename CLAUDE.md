@@ -15,9 +15,32 @@ decisions (§8).
 
 ## Current status
 
-Pre-M0: only the plan and repo scaffolding exist. No package code yet. Follow the plan's
-milestone order (§5) — M1 (exact enumerator) before the sampler, M6 (fixture freeze) before any
+**M0 done.** `minoodle/interfaces.py` (§4.1 ABCs + `CompositeLikelihood`) and
+`minoodle/simdata.py` (genome-blender adapter + manifest with P1/P2/P3 phase tag) exist;
+`datasets/L0.yaml` regenerates bit-identically. **M1 (exact enumerator) is next.**
+
+Follow the plan's milestone order (§5) — M1 before the sampler, M6 (fixture freeze) before any
 Rust port, etc. Milestones are hard gates: do not proceed past a failing one.
+
+Deliberately deferred from M0: CI workflow and mypy (add at M2, when there is a numerical gate
+worth protecting), `bench/` (M6). The §4 module layout is created per milestone, not scaffolded
+empty.
+
+### Working with datasets
+
+Generated data lives outside the repo, in `~/Documents/minoodle_run/<dataset>/`:
+
+```bash
+uv run python -m minoodle.simdata run datasets/L0.yaml --out ~/Documents/minoodle_run/L0
+uv run python -m minoodle.simdata verify ~/Documents/minoodle_run/L0/manifest.json
+```
+
+genome-blender is invoked as a shell command from its own conda env (`generate_reads_cmd` in the
+dataset YAML), not imported — the two projects share no environment.
+
+Manifests hash file *content*: `.gz` outputs are hashed decompressed, because gzip's header
+mtime otherwise makes byte-identical reads look non-reproducible. genome-blender at
+`6e1efe0` is verified deterministic under a fixed seed.
 
 ## Constraints an agent should not accidentally violate (plan §6)
 

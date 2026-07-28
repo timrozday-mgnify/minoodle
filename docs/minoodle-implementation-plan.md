@@ -4,6 +4,8 @@ Probabilistic sampling of sequences from a metagenome assembly graph, as an alte
 rules-based consensus assembly.
 
 **Audience:** an autonomous coding agent (Claude Code or equivalent) with repo write access.
+**Progress:** M0 complete (§5 M0 records what shipped, what was deferred, and three findings
+from the run). M1 — the exact enumerator — is next and must not be skipped (§6.5).
 **Changes in rev 6:** candidate R2 accessions recorded; §5.5.2c verification protocol added.
 **Changes in rev 5:** D11-D13 resolved; §5.5.2a (R2 in-scope set) and §5.5.2b
 (reference verification) added; D14-D15 opened.
@@ -333,7 +335,7 @@ Cross-language RNG streams will not match, so:
 
 Hard gates. Do not proceed past a failure.
 
-### M0 — Skeleton and data (0.5–1 day)
+### M0 — Skeleton and data (0.5–1 day) — **DONE**
 - Package, CI, ruff/mypy, pytest, bench harness.
 - ABCs from §4.1 with stubs.
 - Simulation adapters: reproducible data from genome-blender + skiver with a manifest
@@ -341,7 +343,43 @@ Hard gates. Do not proceed past a failure.
   ground-truth sequences.
 - Error-model phase tagging (P1/P2/P3 from §2.5) wired into the config from the start.
 
-**Gate:** tests green; data regenerable from the manifest.
+**Gate:** tests green; data regenerable from the manifest. **Passed.**
+
+**What shipped.** `pyproject.toml` (uv, ruff, pytest); `minoodle/interfaces.py` — the §4.1 ABCs
+plus `OrientedNode` and `CompositeLikelihood`, the latter being the "free ablations by
+composition" mechanism and the only non-stub logic; `minoodle/simdata.py` — `ErrorModelPhase`,
+`Manifest`, `run`, `verify`; `datasets/L0.yaml` with its reference FASTA committed under
+`datasets/refs/`; tests for composite summation and manifest tamper-detection.
+
+**Deferred, deliberately.** CI workflow and mypy → M2, when there is a numerical gate worth
+protecting. `bench/` → M6, per that milestone's own instruction to profile before optimising.
+The §4 module layout is created per milestone rather than scaffolded empty now.
+
+**Conventions established, which later milestones depend on:**
+
+- Generated data lives outside the repo at `~/Documents/minoodle_run/<dataset>/`, matching the
+  existing `genome-blender_run/` convention. The repo holds configs and adapter code only.
+- genome-blender is invoked as a configured shell command (`generate_reads_cmd` in the dataset
+  YAML, pointing at the `genome_blender_dev` conda env), not imported. The two projects share
+  no environment.
+- The manifest records the genome-blender config **verbatim** rather than by path — the config
+  is the reproduction recipe — alongside both repos' git SHAs and sha256 of every reference and
+  output.
+
+**Three findings from the M0 run, recorded because they bit once already:**
+
+1. **Hash content, not container.** The first reproducibility check showed differing FASTQ
+   hashes between two identically-seeded runs. The cause was gzip's embedded header mtime; the
+   decompressed reads were byte-identical. `FileRecord` now hashes `.gz` files decompressed.
+   Any future output format that embeds a timestamp needs the same treatment, or the M2
+   reproducibility claims will fail spuriously.
+2. **genome-blender is deterministic under a fixed seed** (verified at `6e1efe0`, two runs, all
+   three outputs identical once (1) was handled). The contingency noted for a
+   non-deterministic simulator was not needed.
+3. **`num_reads` is total reads, not pairs.** `num_reads: 20000` with `paired_end: true` yields
+   10000 fragments / 10000 pairs. Coverage arithmetic for L1–L3 and the §5.5.2a expected-coverage
+   partition must use this convention. Current-version genome-blender also gzips its FASTQ where
+   older run directories hold plain `.fastq`; the adapter accepts either.
 
 ### M1 — Exact enumerator (1 day) — *before the sampler*
 Enumerate all paths up to a length bound in tiny hand-built graphs (≤ 20 nodes, ≤ 1e5 paths);

@@ -1,0 +1,29 @@
+# L0 — §5.5.1 lowest rung: one sequence, no errors.
+# Smoke test for the whole pipeline. Gate: recovers the sequence; log Ẑ correct.
+
+name: L0
+error_model_phase: P1
+
+# genome-blender lives in its own conda env; this is the command, not an import dependency.
+generate_reads_cmd: >-
+  /Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python
+  /Users/timrozday/Documents/genome-blender/generate_reads.py
+
+genomes:
+  - genome_id: MGYG000290000_1
+    fasta_path: refs/MGYG000290000_1.fna   # 100,260 bp, single contig
+    abundance: 1
+
+genome_blender:
+  num_reads: 20000              # ~30x over 100 kb at 2x150
+  fragment_mean: 400.0          # FRAGMENT LENGTH = outer distance (§2.6), per D10
+  fragment_variance: 10000.0    # sd 100, per D10
+  read_length_mean: 150.0
+  read_length_variance: 0.0
+  paired_end: true
+  error_model: none
+  seed: 42
+
+notes:
+  - "error_model: none — L0 is the error-free rung; the P1 tag records that when errors are
+     switched on they come from the same skiver model genome-blender simulates with (§2.5)."
