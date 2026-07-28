@@ -4,8 +4,9 @@ Probabilistic sampling of sequences from a metagenome assembly graph, as an alte
 rules-based consensus assembly.
 
 **Audience:** an autonomous coding agent (Claude Code or equivalent) with repo write access.
-**Progress:** M0 complete (§5 M0 records what shipped, what was deferred, and three findings
-from the run). M1 — the exact enumerator — is next and must not be skipped (§6.5).
+**Progress:** M0 and M1 complete; each milestone records what shipped, what was deferred, and
+the findings from the run. M2 — SMC validated against the M1 exact posteriors — is next.
+Note M1's finding 1: the §2.3 prior is implemented as the normalised per-base geometric.
 **Changes in rev 6:** candidate R2 accessions recorded; §5.5.2c verification protocol added.
 **Changes in rev 5:** D11-D13 resolved; §5.5.2a (R2 in-scope set) and §5.5.2b
 (reference verification) added; D14-D15 opened.
@@ -381,15 +382,45 @@ The §4 module layout is created per milestone rather than scaffolded empty now.
    partition must use this convention. Current-version genome-blender also gzips its FASTQ where
    older run directories hold plain `.fastq`; the adapter accepts either.
 
-### M1 — Exact enumerator (1 day) — *before the sampler*
+### M1 — Exact enumerator (1 day) — *before the sampler* — **DONE**
 Enumerate all paths up to a length bound in tiny hand-built graphs (≤ 20 nodes, ≤ 1e5 paths);
 compute exact `π` by brute force. Graphs: (a) linear chain, (b) one bubble, (c) nested bubbles,
 (d) a repeat visited twice.
 
-**Gate:** exact posteriors stored as fixtures.
+**Gate:** exact posteriors stored as fixtures. **Passed.**
 
 Do not skip. Without a ground-truth posterior you cannot distinguish "sampler works" from
 "sampler produces plausible-looking sequences", and every rigour claim rests on that.
+
+**What shipped.** `minoodle/exact.py`: `ToyGraph` (a `PathGraph` whose every forward edge
+installs its bidirected twin on construction, so orientation cannot be got wrong in a fixture),
+a `build()` helper that makes edge sequences satisfy the k−1 overlap by construction (union-find
+over unitig ports, one shared joint string per equivalence class), the four graphs at k=5, the
+§2.3 prior, `GCBias` (a fixture-only likelihood term — the real terms are M4), `enumerate_paths`,
+and `.npz` + `manifest.json` fixture I/O with a 1e-9 re-enumeration check (§4.2). Fixtures are
+committed under `fixtures/` but **not frozen**; freezing is M6.
+
+**Three findings, each of which changes something later:**
+
+1. **The §2.3 formula as written is not a probability measure.**
+   `p_start · Π_t [(1-ρ)^{len_t} · p_edge] · ρ` survives the last unitig's bases *and then* stops
+   with probability ρ, which does not sum to 1 over paths. Implemented instead is the per-base
+   geometric that §2.3's own prose specifies: the path ends when the stop lands *within* the last
+   unitig's new bases, terminal factor `1 - (1-ρ)^{len_T}`, and 1 at a dead end where STOP is
+   forced (§2.8). That sums to exactly 1 on an acyclic graph, and asserting it is the test that
+   catches essentially every length-accounting bug. M2's `log Ẑ` comparison depends on both sides
+   using this convention.
+2. **`IncrementalLikelihood.init` needed a log increment.** The §4.1 sketch returns only a
+   `State`, which leaves the start unitig's own bases unscored — free likelihood for the first
+   node. Amended to `init(start) -> (state, float)`, mirroring `extend`; the SMC engine needs the
+   same number as a particle's initial log-weight. The Rust traits at M7 follow the amended form.
+3. **The prior is directional; only the likelihood is RC-symmetric.** A path and its reverse
+   complement are different states with different start nodes, out-degrees and terminal unitigs,
+   so their *priors* legitimately differ. §5 M3's property test must therefore be stated over `L`,
+   not over `π`. Tested here on all four graphs.
+
+**Deliberately not done:** per-branch marginals (§3.4) — a few lines off the enumeration, added
+at M2 when there is a consumer.
 
 ### M2 — SMC validated against exact (2–3 days)
 Fully-adapted step, systematic resampling, ancestry tracking, island model.

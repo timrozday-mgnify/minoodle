@@ -77,7 +77,13 @@ class IncrementalLikelihood(ABC):
     """
 
     @abstractmethod
-    def init(self, start: OrientedNode) -> Any: ...
+    def init(self, start: OrientedNode) -> tuple[Any, float]:
+        """Return `(state, log increment)` for a path consisting of `start` alone.
+
+        Amended at M1 from the §4.1 sketch's `-> State`: the start unitig's own bases score
+        like any other bases, and with no return channel for them the first node was silently
+        free. The SMC engine needs the same number as a particle's initial log-weight.
+        """
 
     @abstractmethod
     def extend(self, st: Any, e: Edge) -> tuple[Any, float]:
@@ -93,8 +99,14 @@ class CompositeLikelihood(IncrementalLikelihood):
     def __init__(self, terms: list[IncrementalLikelihood]):
         self.terms = list(terms)
 
-    def init(self, start: OrientedNode) -> tuple[Any, ...]:
-        return tuple(t.init(start) for t in self.terms)
+    def init(self, start: OrientedNode) -> tuple[tuple[Any, ...], float]:
+        states: list[Any] = []
+        total = 0.0
+        for term in self.terms:
+            sub, incr = term.init(start)
+            states.append(sub)
+            total += incr
+        return tuple(states), total
 
     def extend(self, st: tuple[Any, ...], e: Edge) -> tuple[tuple[Any, ...], float]:
         states: list[Any] = []

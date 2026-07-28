@@ -15,9 +15,24 @@ decisions (§8).
 
 ## Current status
 
-**M0 done.** `minoodle/interfaces.py` (§4.1 ABCs + `CompositeLikelihood`) and
-`minoodle/simdata.py` (genome-blender adapter + manifest with P1/P2/P3 phase tag) exist;
-`datasets/L0.yaml` regenerates bit-identically. **M1 (exact enumerator) is next.**
+**M0, M1 done.** `minoodle/interfaces.py` (§4.1 ABCs + `CompositeLikelihood`),
+`minoodle/simdata.py` (genome-blender adapter + manifest with P1/P2/P3 phase tag;
+`datasets/L0.yaml` regenerates bit-identically) and `minoodle/exact.py` (toy graphs, §2.3
+prior, brute-force enumerator, golden fixtures in `fixtures/`). **M2 (SMC validated against
+exact) is next** — the exact posteriors it must match are in `fixtures/`.
+
+Two things M1 settled that M2 depends on:
+
+- `IncrementalLikelihood.init` now returns `(state, log increment)`, not just `state`. The
+  §4.1 sketch left the start unitig's own bases unscored, and SMC needs that number as a
+  particle's initial log-weight.
+- The §2.3 prior formula as written does not normalise; `exact.py` implements the per-base
+  geometric its prose describes (terminal factor `1 - (1-ρ)^{len_T}`, forced STOP at dead
+  ends). `Σ p(x) == 1` on an acyclic toy graph is the test that guards it.
+
+```bash
+uv run python -m minoodle.exact verify fixtures/manifest.json
+```
 
 Follow the plan's milestone order (§5) — M1 before the sampler, M6 (fixture freeze) before any
 Rust port, etc. Milestones are hard gates: do not proceed past a failing one.

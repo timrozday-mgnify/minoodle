@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "graphs": [
+    {
+      "name": "chain",
+      "file": "chain.npz",
+      "k": 5,
+      "n_unitigs": 3,
+      "rho": 0.02,
+      "uniform_start": false,
+      "beta": 0.05,
+      "max_bases": 250,
+      "n_paths": 12,
+      "truncated": 0,
+      "log_Z": 0.4515124470853151,
+      "prior_mass": 1.0,
+      "arrays_sha256": "0d37a37bc5fedd6f50c9534d47e14812267f04bf7089b989d4f8d049f793dfa2"
+    },
+    {
+      "name": "bubble",
+      "file": "bubble.npz",
+      "k": 5,
+      "n_unitigs": 4,
+      "rho": 0.02,
+      "uniform_start": false,
+      "beta": 0.05,
+      "max_bases": 250,
+      "n_paths": 20,
+      "truncated": 0,
+      "log_Z": 0.6130705818678392,
+      "prior_mass": 0.9999999999999996,
+      "arrays_sha256": "2c327138559eb7b6f48ce60d254a51b7dde6abe45ebbd71a9c0bc02485c0519d"
+    },
+    {
+      "name": "nested_bubbles",
+      "file": "nested_bubbles.npz",
+      "k": 5,
+      "n_unitigs": 7,
+      "rho": 0.02,
+      "uniform_start": false,
+      "beta": 0.05,
+      "max_bases": 250,
+      "n_paths": 56,
+      "truncated": 0,
+      "log_Z": 0.7506254636740923,
+      "prior_mass": 1.0,
+      "arrays_sha256": "180570e3e6a3aaec9af6ee09f31adec7f071fe2060d4728d1034235361d1385f"
+    },
+    {
+      "name": "repeat_twice",
+      "file": "repeat_twice.npz",
+      "k": 5,
+      "n_unitigs": 4,
+      "rho": 0.02,
+      "uniform_start": false,
+      "beta": 0.05,
+      "max_bases": 250,
+      "n_paths": 242,
+      "truncated": 8,
+      "log_Z": 0.6335326314226306,
+      "prior_mass": 0.9999994013761921,
+      "arrays_sha256": "81a8eb04b8fdc028e9efbcbf87fb2c18dde7ad1c09cefce48a3df4495326cb21"
+    }
+  ]
+}

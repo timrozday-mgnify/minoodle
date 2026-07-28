@@ -8,7 +8,7 @@ class Counter(IncrementalLikelihood):
         self.incr = incr
 
     def init(self, start):
-        return 0
+        return 0, self.incr
 
     def extend(self, st, e):
         return st + 1, self.incr
@@ -19,8 +19,9 @@ class Counter(IncrementalLikelihood):
 
 def test_composite_sums_increments_and_threads_states():
     comp = CompositeLikelihood([Counter(1.0), Counter(0.25)])
-    st = comp.init(OrientedNode(0, True))
+    st, incr = comp.init(OrientedNode(0, True))
     assert st == (0, 0)
+    assert incr == 1.25
 
     st, incr = comp.extend(st, OrientedNode(1, True))
     assert incr == 1.25
@@ -33,7 +34,8 @@ def test_composite_sums_increments_and_threads_states():
 
 def test_composite_of_no_terms_is_zero():
     comp = CompositeLikelihood([])
-    st = comp.init(OrientedNode(0, True))
+    st, incr = comp.init(OrientedNode(0, True))
+    assert incr == 0.0
     st, incr = comp.extend(st, OrientedNode(1, True))
     assert incr == 0.0
     assert comp.stop_logp(st) == 0.0
