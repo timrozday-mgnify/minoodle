@@ -1,0 +1,22 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --extra dev
+      - run: uv run ruff check .
+      - run: uv run pytest -q
+      # The exact posteriors the sampler is validated against must regenerate bit-identically
+      # (§4.2); the fast tests above only compare the sampler to them.
+      - run: uv run python -m minoodle.exact verify fixtures/manifest.json
+      # The M2 gate proper. ~5 s at N = 1e5 in pure Python, so there is no reason to defer it.
+      - run: uv run python -m minoodle.sampler validate fixtures/manifest.json

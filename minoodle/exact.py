@@ -270,6 +270,10 @@ class Enumeration:
     def pi(self) -> np.ndarray:
         return np.exp(self.log_pi_unnorm - self.log_Z)
 
+    def posterior(self) -> dict[tuple[OrientedNode, ...], float]:
+        """`{path: π(x)}`, the shape the sampler's output is compared against (§5 M2)."""
+        return dict(zip(self.paths, (float(p) for p in self.pi), strict=True))
+
     @property
     def prior_mass(self) -> float:
         """Σ p(x) over enumerated paths. Exactly 1 on an acyclic graph."""

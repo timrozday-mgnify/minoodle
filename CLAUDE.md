@@ -15,31 +15,44 @@ decisions (§8).
 
 ## Current status
 
-**M0, M1 done.** `minoodle/interfaces.py` (§4.1 ABCs + `CompositeLikelihood`),
+**M0, M1, M2 done.** `minoodle/interfaces.py` (§4.1 ABCs + `CompositeLikelihood`),
 `minoodle/simdata.py` (genome-blender adapter + manifest with P1/P2/P3 phase tag;
-`datasets/L0.yaml` regenerates bit-identically) and `minoodle/exact.py` (toy graphs, §2.3
-prior, brute-force enumerator, golden fixtures in `fixtures/`). **M2 (SMC validated against
-exact) is next** — the exact posteriors it must match are in `fixtures/`.
-
-Two things M1 settled that M2 depends on:
-
-- `IncrementalLikelihood.init` now returns `(state, log increment)`, not just `state`. The
-  §4.1 sketch left the start unitig's own bases unscored, and SMC needs that number as a
-  particle's initial log-weight.
-- The §2.3 prior formula as written does not normalise; `exact.py` implements the per-base
-  geometric its prose describes (terminal factor `1 - (1-ρ)^{len_T}`, forced STOP at dead
-  ends). `Σ p(x) == 1` on an acyclic toy graph is the test that guards it.
+`datasets/L0.yaml` regenerates bit-identically), `minoodle/exact.py` (toy graphs, §2.3 prior,
+brute-force enumerator, golden fixtures in `fixtures/`) and `minoodle/sampler.py` +
+`minoodle/diagnostics.py` (SMC, validated against those fixtures). **M3 (metaSPAdes GFA and
+index) is next.**
 
 ```bash
 uv run python -m minoodle.exact verify fixtures/manifest.json
+uv run python -m minoodle.sampler validate fixtures/manifest.json   # the M2 gate, ~5 s
 ```
+
+Things earlier milestones settled that later code depends on:
+
+- `IncrementalLikelihood.init` returns `(state, log increment)`, not just `state`. The §4.1
+  sketch left the start unitig's own bases unscored, and SMC needs that number as a particle's
+  initial log-weight.
+- The §2.3 prior formula as written does not normalise; `exact.py` implements the per-base
+  geometric its prose describes (terminal factor `1 - (1-ρ)^{len_T}`, forced STOP at dead
+  ends). `Σ p(x) == 1` on an acyclic toy graph is the test that guards it, and the sampler's
+  counterpart — prior-only `log Ẑ == 0.0` exactly — is the sharpest test in `test_sampler.py`.
+- **STOP is one of the fully-adapted alternatives** in the SMC step, not a separate case; §3.2's
+  pseudocode shows out-edges only. Anything that changes the alternative set changes the target.
+- Truncation at `max_bases` must match `enumerate_paths` exactly: drop the over-long extension,
+  but still score STOP by *graph* out-degree, not "nothing legal left".
+- The `TV < 0.01` gate is enforced against an exact-iid reference band, not the flat number —
+  242 atoms at N = 1e5 put a perfect sampler above 0.01 on `repeat_twice` (M2 finding 1).
+- Adaptive resampling never fires on the toy graphs (ESS stays ≥ 0.84 N), so that code path is
+  only covered by tests that force it with `ess_frac=1.0`. Watch for the same blind spot when
+  adding anything that only runs under degeneracy.
 
 Follow the plan's milestone order (§5) — M1 before the sampler, M6 (fixture freeze) before any
 Rust port, etc. Milestones are hard gates: do not proceed past a failing one.
 
-Deliberately deferred from M0: CI workflow and mypy (add at M2, when there is a numerical gate
-worth protecting), `bench/` (M6). The §4 module layout is created per milestone, not scaffolded
-empty.
+CI landed at M2 (`.github/workflows/ci.yml` runs ruff, pytest, `exact verify` and the full
+sampler gate). Still deferred: mypy (M3/M4, once the type surface stops moving), `bench/` (M6),
+committed uniform-stream fixtures (M6's freeze). The §4 module layout is created per milestone,
+not scaffolded empty.
 
 ### Working with datasets
 

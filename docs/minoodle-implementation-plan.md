@@ -4,9 +4,10 @@ Probabilistic sampling of sequences from a metagenome assembly graph, as an alte
 rules-based consensus assembly.
 
 **Audience:** an autonomous coding agent (Claude Code or equivalent) with repo write access.
-**Progress:** M0 and M1 complete; each milestone records what shipped, what was deferred, and
-the findings from the run. M2 — SMC validated against the M1 exact posteriors — is next.
+**Progress:** M0, M1 and M2 complete; each milestone records what shipped, what was deferred, and
+the findings from the run. M3 — metaSPAdes GFA and index — is next.
 Note M1's finding 1: the §2.3 prior is implemented as the normalised per-base geometric.
+Note M2's finding 1: the `TV < 0.01` gate is restated against an exact-iid reference band.
 **Changes in rev 6:** candidate R2 accessions recorded; §5.5.2c verification protocol added.
 **Changes in rev 5:** D11-D13 resolved; §5.5.2a (R2 in-scope set) and §5.5.2b
 (reference verification) added; D14-D15 opened.
@@ -422,12 +423,60 @@ committed under `fixtures/` but **not frozen**; freezing is M6.
 **Deliberately not done:** per-branch marginals (§3.4) — a few lines off the enumeration, added
 at M2 when there is a consumer.
 
-### M2 — SMC validated against exact (2–3 days)
+### M2 — SMC validated against exact (2–3 days) — **DONE**
 Fully-adapted step, systematic resampling, ancestry tracking, island model.
 
 **Gate:** TV distance < 0.01 at N = 1e5 on all four toy graphs; `log Ẑ` within Monte Carlo
 error of exact `log Z`; SBC rank statistics uniform. If not met the bug is in weight
-bookkeeping — fix it, don't add features.
+bookkeeping — fix it, don't add features. **Passed, with the TV criterion restated — see
+finding 1.**
+
+**What shipped.** `minoodle/sampler.py`: the fully-adapted step of §3.2 with STOP as one of the
+alternatives, an equally fully-adapted start step, adaptive systematic resampling at `ESS < N/2`,
+an ancestry arena (`(T, N)` node codes plus per-step parent permutations, no copied path lists),
+the island model, deduplicated weighted output with summed weights, per-branch marginals, and a
+`validate` subcommand that reruns the gate against `fixtures/`. `minoodle/diagnostics.py`: ESS,
+systematic resampling, lineage reconstruction, per-locus ESS, TV, the iid TV reference, and the
+calibration rank machinery. `Enumeration.posterior()` and `branch_marginals()` close M1's
+deferred item. CI added (`.github/workflows/ci.yml`: ruff, pytest, `exact verify`, and the full
+N = 1e5 gate, which runs in ~5 s). mypy still deferred — the type surface moves again at M3/M4.
+
+**Findings:**
+
+1. **`TV < 0.01` at N = 1e5 is unattainable on `repeat_twice` by any sampler.** With 242 atoms,
+   an *exact iid* sampler of 1e5 draws averages TV 0.0104 against π (0.0123 at the 99th
+   percentile); the threshold is a property of the atom count, not of the sampler. The gate is
+   therefore stated as *TV within the band an exact iid sampler of the same achieved ESS would
+   incur* (`multinomial_tv_reference`), which is the criterion the flat number was reaching for.
+   Measured: TV/iid-p99 = 0.48, 0.60, 0.88, 0.98 on the four graphs, i.e. the sampler is
+   statistically indistinguishable from exact iid sampling at its own ESS. The absolute number is
+   still printed, and still met on the other three graphs.
+2. **Adaptive resampling never triggers on the toy graphs.** The fully-adapted step is effective
+   enough that ESS stays at 0.84–0.98 N to the end of every run, so `ESS < N/2` never fires and
+   the resampling, state-permutation and ancestry-permutation paths are dead in a default run —
+   they would have shipped untested. They are exercised deliberately with `ess_frac = 1.0`, which
+   must leave `log Ẑ` and TV unchanged. Expect the same blind spot at M3–M4: any new code that
+   only runs under degeneracy needs forcing, not waiting for real data.
+3. **STOP has to be inside the `logsumexp`, not a separate case.** §3.2's pseudocode enumerates
+   out-edges only. A path may end at any node — `enumerate_paths` emits a record at every node
+   visited — so omitting STOP from the fully-adapted alternative set targets a different measure.
+   The test that catches it instantly is the sampler's analogue of M1's `Σ p(x) == 1`: with no
+   likelihood, every step's `logsumexp` is the prior's total continuation mass, so `log Ẑ` is
+   *exactly* 0.0 with no Monte Carlo error at all. That, plus truncation matching the enumerator's
+   (drop the over-long extension, but still score STOP by *graph* out-degree), is the whole of the
+   weight bookkeeping the gate warns about.
+4. **SBC is degenerate until there is a generative likelihood.** `GCBias` is a bare potential:
+   there is no data to draw, so the prior → data → posterior loop does not exist yet. Implemented
+   is what SBC reduces to with the data integrated out — an exact draw from π is exchangeable with
+   the sampler's draws, so its randomised rank among them is uniform (KS p = 0.56 over 300
+   replicates). Ranks must be randomised: every statistic on a 20-path graph is heavily tied and
+   plain `#{v < x}` is not uniform under the null. Proper SBC arrives with M4's error model.
+
+**Deliberately not done:** rejuvenation MH moves (§3.3 item 3) and stratified starts (item 5) —
+neither is in this milestone's deliverable line, and per finding 2 there is no degeneracy on
+these graphs for them to fix. Add when a real graph shows early-locus ESS collapsing. Recorded
+uniform streams are consumed through the injected seam and the draw count is asserted, but no
+stream is committed as a fixture yet; that is M6's freeze (§4.2).
 
 ### M3 — metaSPAdes GFA and index (2–3 days)
 
