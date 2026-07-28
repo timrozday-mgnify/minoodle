@@ -11,10 +11,10 @@ import gzip
 
 import pytest
 
-from minoodle.exact import bubble, chain, repeat_twice
+from minoodle.exact import bubble, chain, repeat_twice, weighted_seed_proposal
 from minoodle.graph import code, decode, revcomp
-from minoodle.index import KmerIndex, check, fragment_length
-from minoodle.interfaces import OrientedNode
+from minoodle.index import KmerIndex, check, fragment_length, seed_weights
+from minoodle.interfaces import OrientedNode, Seed
 from tests.test_graph import as_unitig_graph
 
 
@@ -94,3 +94,33 @@ def test_same_strand_pair_is_not_measured():
     a, b = idx.anchor(seq[0:6]), idx.anchor(seq[6:12])
     assert a is not None and b is not None
     assert fragment_length(idx, a, b, 6, 6) is None
+
+
+def test_seed_weights_follow_the_reads_and_stay_rc_symmetric():
+    """`q_seed`'s weights (D18): anchored k-mer placements per seed, both strands credited.
+
+    Reads are sliced from one unitig only, so every other unitig must come out at zero — that
+    is the partial-support case `weighted_seed_proposal`'s `eps` exists to cover, and it is the
+    one that biases `log Ẑ` rather than merely inflating its variance.
+    """
+    g = as_unitig_graph(chain())
+    idx = KmerIndex(g)
+    covered, elsewhere = OrientedNode(2, True), OrientedNode(0, True)
+    seq = g.unitig_seq(covered)
+    reads = [seq[i : i + 9] for i in range(len(seq) - 9 + 1)]
+
+    w = seed_weights(idx, reads)
+    seeds = g.seeds()
+    assert w.shape == (len(seeds),)
+    by_seed = dict(zip(seeds, w, strict=True))
+
+    span = len(seq) - g.k
+    assert all(by_seed[Seed(covered, o)] > 0 for o in range(span + 1))
+    assert all(by_seed[Seed(elsewhere, o)] == 0 for o in range(len(g.unitig_seq(elsewhere)) - g.k + 1))
+    # a seed and its reverse complement are distinct states of an RC-symmetric target
+    for o in range(span + 1):
+        assert by_seed[Seed(covered, o)] == by_seed[Seed(covered.flipped(), span - o)]
+
+    proposal = weighted_seed_proposal(g, w, eps=0.05)
+    assert proposal.q.sum() == pytest.approx(1.0)
+    assert (proposal.q > 0).all()

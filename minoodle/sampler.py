@@ -6,19 +6,26 @@ discrete bidirected graph and the resampling routine worth borrowing is eight li
 
     python -m minoodle.sampler validate fixtures/manifest.json --particles 100000
 
-Three things carry the whole correctness argument, and all three are weight bookkeeping:
+Four things carry the whole correctness argument, and all four are weight bookkeeping:
 
-1. **STOP is one of the fully-adapted alternatives.** §3.2's pseudocode enumerates out-edges
-   only; a path may end at any node, and `exact.enumerate_paths` emits a record at every node
-   visited, so leaving STOP out of the `logsumexp` targets a different measure and `log Ẑ`
-   silently disagrees with `log Z`.
+1. **STOP is one of the fully-adapted alternatives, per side.** §3.2's pseudocode enumerates
+   out-edges only; a frontier may stop anywhere, so leaving STOP out of the `logsumexp` targets
+   a different measure and `log Ẑ` silently disagrees with `log Z`. A particle is absorbed only
+   when *both* sides have stopped.
 2. **The prior is M1's normalised per-base geometric**, reused verbatim from `exact` rather
-   than re-derived here. Two implementations of the same formula is two chances to get the
-   length accounting wrong.
+   than re-derived here — including `next_side`, so the alternation cannot drift. Two
+   implementations of the same formula is two chances to get the length accounting wrong.
 3. **Truncation matches the enumerator.** `enumerate_paths` drops an extension that would push
    the sequence past `max_bases` but still scores STOP with `dead_end` meaning *graph*
-   out-degree zero, not "nothing legal left". The lost mass (6e-7 on `repeat_twice`) is part of
-   the target the fixtures encode, so the sampler has to lose exactly the same mass.
+   out-degree zero, not "nothing legal left". The lost mass (2e-3 on `repeat_twice`, whose
+   budget is deliberately tight enough to make that mass visible) is part of the target the
+   fixtures encode, so the sampler has to lose exactly the same mass.
+4. **The seed is a proposal, not the prior (D18).** Seeds are drawn from `q_seed` and the
+   initial log-weight carries `log p_seed - log q_seed`. The target does not depend on
+   `q_seed`, so swapping the proposal must not move the posterior — that invariance is the
+   test that catches a mis-normalised or partial-support `q`. Under `uniform_seed_proposal`
+   (`q = p`) prior-only `log Ẑ` is 0 exactly; under any other proposal it is 0 only in
+   expectation.
 
 Per §4.2 the engine takes an injected `uniforms(k) -> ndarray` source and consumes a
 predictable number of draws per step (`N` for the choices, one more if resampling triggers), so
@@ -45,17 +52,28 @@ from minoodle.exact import (
     TOY_GRAPHS,
     GCBias,
     PriorParams,
+    SeedProposal,
+    StatePath,
     ToyGraph,
     code,
     decode,
     enumerate_paths,
-    start_logp,
+    next_side,
+    seed_logp,
+    set_side,
     survive_logp,
     terminal_logp,
+    uniform_seed_proposal,
+    weighted_seed_proposal,
 )
-from minoodle.interfaces import IncrementalLikelihood, OrientedNode
+from minoodle.interfaces import (
+    IncrementalLikelihood,
+    OrientedNode,
+    PathGraph,
+    Seed,
+    Side,
+)
 
-Path_ = tuple[OrientedNode, ...]
 Uniforms = Callable[[int], np.ndarray]
 
 
@@ -75,6 +93,8 @@ DEFAULT_CONFIG = SMCConfig()
 
 def _logsumexp(x: list[float]) -> float:
     m = max(x)
+    if m == -math.inf:  # every alternative impossible; `m - m` would be a nan
+        return -math.inf
     return m + math.log(sum(math.exp(v - m) for v in x))
 
 
@@ -93,22 +113,28 @@ class IslandResult:
 
     log_Z: float
     log_w: np.ndarray  # incremental weights since the last resampling
-    nodes: np.ndarray  # (T, N) node codes, recorded before each step's resampling
+    nodes: np.ndarray  # (T, N) node codes, -1 where the step was a STOP or the particle was
+    sides: np.ndarray  # (T, N) which frontier that step extended
     parents: list[np.ndarray]
-    path_len: np.ndarray
+    seeds: list[Seed]  # per surviving particle; rides along through resampling
 
-    def paths(self) -> list[Path_]:
+    def paths(self) -> list[StatePath]:
         lin = diag.lineage(self.parents)
-        taken = np.take_along_axis(self.nodes, lin, axis=1)
-        return [
-            tuple(decode(int(c)) for c in taken[: self.path_len[i], i])
-            for i in range(self.log_w.size)
-        ]
+        nodes = np.take_along_axis(self.nodes, lin, axis=1)
+        sides = np.take_along_axis(self.sides, lin, axis=1)
+        out: list[StatePath] = []
+        for i in range(self.log_w.size):
+            walks: tuple[list, list] = ([], [])
+            for c, s in zip(nodes[:, i], sides[:, i], strict=True):
+                if c >= 0:
+                    walks[int(s)].append(decode(int(c)))
+            out.append((self.seeds[i], tuple(walks[Side.LEFT]), tuple(walks[Side.RIGHT])))
+        return out
 
-    def posterior(self) -> dict[Path_, float]:
+    def posterior(self) -> dict[StatePath, float]:
         """Deduplicated with *summed* normalised weights (§3.4)."""
         w = diag.normalise(self.log_w)
-        out: dict[Path_, float] = {}
+        out: dict[StatePath, float] = {}
         for p, wi in zip(self.paths(), w, strict=True):
             out[p] = out.get(p, 0.0) + float(wi)
         return out
@@ -132,13 +158,13 @@ class SMCResult:
         convergence assertion (§3.4)."""
         return float(np.std([i.log_Z for i in self.islands], ddof=1)) if len(self.islands) > 1 else 0.0
 
-    def posterior(self) -> dict[Path_, float]:
+    def posterior(self) -> dict[StatePath, float]:
         """Islands pooled in proportion to their own `Ẑ`, which is what makes the pooled
         estimate the ratio estimator rather than an average of ratios."""
         z = np.array([i.log_Z for i in self.islands])
         share = np.exp(z - z.max())
         share /= share.sum()
-        out: dict[Path_, float] = {}
+        out: dict[StatePath, float] = {}
         for s, island in zip(share, self.islands, strict=True):
             for p, w in island.posterior().items():
                 out[p] = out.get(p, 0.0) + float(s) * w
@@ -149,125 +175,176 @@ class SMCResult:
 
 
 def run_island(
-    graph: ToyGraph,
+    graph: PathGraph,
     likelihood: IncrementalLikelihood,
     params: PriorParams,
     cfg: SMCConfig,
     uniforms: Uniforms,
+    proposal: SeedProposal,
 ) -> IslandResult:
     n = cfg.n_particles
+    lp_seed = seed_logp(graph)
+    log_q = proposal.log_q
 
-    # Fully-adapted start step: the start node is drawn from its exact conditional and the
-    # weight picks up the whole normalising constant, including the mass of any start unitig
-    # already longer than `max_bases` (dropped, as `enumerate_paths` drops it).
-    # ponytail: every start's likelihood state is materialised once per island. Fine at 2n
-    # nodes; if M3's graph makes that heavy, make it lazy per sampled node.
-    opts0: list[tuple[OrientedNode, Any, int]] = []
-    gam0: list[float] = []
-    for s in graph.nodes():
-        nb = graph.new_bases(s, first=True)
-        if nb > cfg.max_bases:
-            continue
-        st, incr = likelihood.init(s)
-        opts0.append((s, st, nb))
-        gam0.append(start_logp(graph, s, params) + incr)
-    total0 = _logsumexp(gam0)
+    # Seeds come from `q_seed`, one uniform each, and the weight carries `log p - log q`
+    # (D18). Not fully adapted over seeds the way the old start step was over start nodes:
+    # that is O(#seeds) per island, which a real graph makes impossible.
+    cdf = np.cumsum(proposal.q)
+    idx0 = np.minimum(np.searchsorted(cdf, uniforms(n), side="right"), len(cdf) - 1)
 
-    u = uniforms(n)
-    chosen = [opts0[_pick(gam0, total0, float(ui))] for ui in u]
-    node = [c[0] for c in chosen]
-    state = [c[1] for c in chosen]
-    pending = np.array([c[2] for c in chosen], dtype=np.int64)
-    total = pending.copy()
-    log_w = np.full(n, total0)
-    alive = np.ones(n, dtype=bool)
-    path_len = np.ones(n, dtype=np.int64)
+    node: list[tuple[OrientedNode, OrientedNode]] = []
+    state: list[Any] = []
+    pending = np.zeros((n, 2), dtype=np.int64)
+    log_w = np.empty(n)
+    seeds: list[Seed] = []
+    total = np.zeros(n, dtype=np.int64)
+    for i, j in enumerate(idx0):
+        seed = proposal.seeds[j]
+        seed_len = len(graph.unitig_seq(seed.node))
+        if seed_len > cfg.max_bases:
+            # ponytail: `enumerate_paths` drops these seeds outright, so a proposal that can
+            # reach one targets a different measure. Toy graphs never do. M4 revisits when
+            # real unitigs meet a real budget — probably by making `max_bases` unbounded.
+            raise ValueError(f"seed unitig {seed_len} bp exceeds max_bases {cfg.max_bases}")
+        st, incr = likelihood.init(seed)
+        seeds.append(seed)
+        state.append(st)
+        node.append((seed.node.flipped(), seed.node))
+        pending[i] = (seed.offset, seed_len - graph.k - seed.offset)
+        total[i] = seed_len
+        log_w[i] = lp_seed - log_q[j] + incr
 
+    stopped = np.zeros((n, 2), dtype=bool)
     nodes_hist: list[np.ndarray] = []
+    sides_hist: list[np.ndarray] = []
     parents: list[np.ndarray] = []
     log_Z = 0.0
-    first_step = True
+    t = 0
 
     while True:
-        if not first_step:
-            u = uniforms(n)
-            for i in np.flatnonzero(alive):
-                nd = node[i]
-                out = graph.out_edges(nd)
-                gammas = [terminal_logp(int(pending[i]), out.size == 0, params)
-                          + likelihood.stop_logp(state[i])]
-                opts: list[tuple[OrientedNode, Any, int] | None] = [None]
-                if out.size:
-                    base = survive_logp(int(pending[i]), params) - math.log(out.size)
-                    for c in out:
-                        nxt = decode(int(c))
-                        nb = graph.new_bases(nxt, first=False)
-                        if total[i] + nb > cfg.max_bases:
-                            continue
-                        st2, incr = likelihood.extend(state[i], nxt)
-                        gammas.append(base + incr)
-                        opts.append((nxt, st2, nb))
-                step_total = _logsumexp(gammas)
-                log_w[i] += step_total
-                choice = opts[_pick(gammas, step_total, float(u[i]))]
-                if choice is None:
-                    alive[i] = False
-                else:
-                    node[i], state[i], nb = choice
-                    pending[i] = nb
-                    total[i] += nb
-                    path_len[i] += 1
-        first_step = False
+        u = uniforms(n)
+        row_node = np.full(n, -1, dtype=np.int64)
+        row_side = np.zeros(n, dtype=np.int8)
+        for i in np.flatnonzero(~stopped.all(axis=1)):
+            side = next_side(t, bool(stopped[i, 0]), bool(stopped[i, 1]))
+            assert side is not None
+            out = graph.out_edges(node[i][side])
+            # STOP is inside the `logsumexp`, and a dead end leaves it there alone with its
+            # forced weight of 0 — not a branch around the alternative set (§3.2).
+            gammas = [
+                terminal_logp(int(pending[i, side]), out.size == 0, params)
+                + likelihood.stop_logp(state[i], side)
+            ]
+            opts: list[tuple[OrientedNode, Any, int] | None] = [None]
+            if out.size:
+                base = survive_logp(int(pending[i, side]), params) - math.log(out.size)
+                for c in out:
+                    nxt = decode(int(c))
+                    nb = graph.new_bases(nxt, first=False)
+                    if total[i] + nb > cfg.max_bases:
+                        continue  # dropped, exactly as `enumerate_paths` drops it
+                    st2, incr = likelihood.extend(state[i], nxt, side)
+                    gammas.append(base + incr)
+                    opts.append((nxt, st2, nb))
+            step_total = _logsumexp(gammas)
+            if step_total == -math.inf:
+                # No bases left for this side to stop in *and* every extension over budget.
+                # `enumerate_paths` drops the subtree at that point, so the particle has to
+                # die with zero weight rather than pick an impossible alternative.
+                log_w[i] = -math.inf
+                stopped[i] = True
+                continue
+            log_w[i] += step_total
+            choice = opts[_pick(gammas, step_total, float(u[i]))]
+            if choice is None:
+                stopped[i, side] = True
+            else:
+                nxt, state[i], nb = choice
+                node[i] = set_side(node[i], side, nxt)
+                pending[i, side] = nb
+                total[i] += nb
+                row_node[i], row_side[i] = code(nxt), int(side)
 
-        nodes_hist.append(np.array([code(nd) for nd in node], dtype=np.int64))
+        nodes_hist.append(row_node)
+        sides_hist.append(row_side)
         if diag.ess(log_w) < cfg.ess_frac * n:
             log_Z += _logsumexp(list(log_w)) - math.log(n)
             idx = diag.systematic_resample(log_w, float(uniforms(1)[0]))
             node = [node[j] for j in idx]
             state = [state[j] for j in idx]
-            pending, total, alive, path_len = (
-                pending[idx], total[idx], alive[idx], path_len[idx]
-            )
+            seeds = [seeds[j] for j in idx]
+            pending, total, stopped = pending[idx], total[idx], stopped[idx]
             log_w = np.zeros(n)
             parents.append(idx)
         else:
             parents.append(np.arange(n))
 
-        if not alive.any():
+        if stopped.all():
             break
+        t += 1
 
     log_Z += _logsumexp(list(log_w)) - math.log(n)
-    return IslandResult(log_Z, log_w, np.array(nodes_hist), parents, path_len)
+    return IslandResult(
+        log_Z, log_w, np.array(nodes_hist), np.array(sides_hist), parents, seeds
+    )
 
 
 def run(
-    graph: ToyGraph,
+    graph: PathGraph,
     likelihood: IncrementalLikelihood,
     params: PriorParams = DEFAULT_PRIOR,
     cfg: SMCConfig = DEFAULT_CONFIG,
     uniforms: Uniforms | None = None,
+    proposal: SeedProposal | None = None,
 ) -> SMCResult:
-    """Islands share one uniform stream but never resample across each other (§3.3 item 4)."""
+    """Islands share one uniform stream but never resample across each other (§3.3 item 4).
+
+    `proposal` defaults to uniform seeding, i.e. `q_seed = p_seed` — the configuration the
+    exact `log Ẑ` tests are stated under.
+    """
     if uniforms is None:
         rng = np.random.default_rng(cfg.seed)
         uniforms = rng.random
-    return SMCResult([run_island(graph, likelihood, params, cfg, uniforms)
+    if proposal is None:
+        proposal = uniform_seed_proposal(graph)
+    return SMCResult([run_island(graph, likelihood, params, cfg, uniforms, proposal)
                       for _ in range(cfg.n_islands)])
 
 
-def branch_marginals(dist: dict[Path_, float]) -> dict[tuple[int, int], float]:
-    """`p(edge used)` summed over paths (§3.4) — for downstream statistics, more useful than
-    the sequences. Takes any `{path: probability}` mapping, so the exact enumeration and the
-    sampler are compared through the same function."""
+def branch_marginals(dist: dict[StatePath, float]) -> dict[tuple[int, int], float]:
+    """`p(edge used)` summed over states (§3.4) — for downstream statistics, more useful than
+    the sequences. Takes any `{state: probability}` mapping, so the exact enumeration and the
+    sampler are compared through the same function.
+
+    Left-side edges are keyed in the flipped orientation they were actually walked in; the
+    two sides are therefore never conflated, and an edge and its twin stay distinguishable.
+    """
     out: dict[tuple[int, int], float] = {}
-    for path, p in dist.items():
-        for a, b in itertools.pairwise(path):
-            key = (code(a), code(b))
-            out[key] = out.get(key, 0.0) + p
+    for (seed, left, right), p in dist.items():
+        for walk in ((seed.node.flipped(),) + left, (seed.node,) + right):
+            for a, b in itertools.pairwise(walk):
+                key = (code(a), code(b))
+                out[key] = out.get(key, 0.0) + p
     return out
 
 
-# --- validation gate (§5 M2) ---------------------------------------------------------------
+# --- validation gate (§5 M2, §5 M3.5) ------------------------------------------------------
+
+
+def _skew(graph: PathGraph, seed: int) -> np.ndarray:
+    """A lopsided seed weighting, standing in for coverage-weighted anchors on a toy graph.
+
+    A decade of spread plus a tenth of the seeds at exactly zero — those are the ones only the
+    `eps` mixture keeps on support, and they are the case that biases the estimator rather than
+    merely inflating its variance. Harsher than this is not a better test, it is just a noisier
+    one: the measured margin against a *broken* `p/q` (importance correction dropped) is TV
+    0.29 vs 0.03, and adding spread degrades the correct run faster than the broken one.
+    """
+    rng = np.random.default_rng(seed + 7)
+    n = len(graph.seeds())
+    w = 10.0 ** rng.uniform(0.0, 1.0, size=n)
+    w[rng.random(n) < 0.1] = 0.0
+    return w
 
 
 def sbc_ranks(
@@ -275,8 +352,8 @@ def sbc_ranks(
     likelihood: IncrementalLikelihood,
     params: PriorParams,
     cfg: SMCConfig,
-    stat: dict[Path_, float],
-    exact_pi: dict[Path_, float],
+    stat: dict[StatePath, float],
+    exact_pi: dict[StatePath, float],
     reps: int,
     n_draws: int,
     rng: np.random.Generator,
@@ -312,7 +389,7 @@ def validate(manifest_path: Path, particles: int, islands: int, seed: int) -> li
     for factory in TOY_GRAPHS:
         g = factory()
         e = by_name[g.name]
-        params = PriorParams(e["rho"], e["uniform_start"])
+        params = PriorParams(e["rho"])
         lik = GCBias(g, e["beta"])
         exact = enumerate_paths(g, lik, params, e["max_bases"])
         target = exact.posterior()
@@ -350,9 +427,35 @@ def validate(manifest_path: Path, particles: int, islands: int, seed: int) -> li
     rng = np.random.default_rng(seed + 1)
     g = TOY_GRAPHS[1]()
     e = by_name[g.name]
-    params = PriorParams(e["rho"], e["uniform_start"])
+    params = PriorParams(e["rho"])
     lik = GCBias(g, e["beta"])
     exact = enumerate_paths(g, lik, params, e["max_bases"])
+
+    # Proposal invariance (§5 M3.5 item 5): the target does not depend on `q_seed`, so a
+    # deliberately skewed proposal must reproduce the same posterior. This is what catches a
+    # mis-normalised or partial-support `q`; neither inherited gate would.
+    cfg = SMCConfig(max(1, particles // islands), islands, e["max_bases"], seed=seed)
+    skewed = weighted_seed_proposal(g, _skew(g, seed), eps=0.05)
+    inv = run(g, lik, params, cfg, proposal=skewed)
+    tv_inv = diag.tv_distance(inv.posterior(), exact.posterior())
+    ess_inv = sum(diag.ess(i.log_w) for i in inv.islands)
+    _, ref_inv = diag.multinomial_tv_reference(exact.pi, max(1, int(ess_inv)))
+    dz_inv = inv.log_Z - e["log_Z"]
+    err_inv = max(inv.log_Z_spread / math.sqrt(islands), 1e-6)
+    print(
+        f"{'q_seed skewed':>15}  TV {tv_inv:.5f} (iid p99 {ref_inv:.5f})  "
+        f"log Z {inv.log_Z:+.6f} (d {dz_inv:+.2e}, island se {err_inv:.2e})  ESS {ess_inv:.0f}"
+    )
+    # 3x, not the M2 gate's 1.25x: a deliberately bad proposal is *meant* to be less efficient
+    # than iid, and the ESS this band is built from is measured after resampling, so it
+    # overstates the surviving seed diversity. Calibrated against the failure it exists to
+    # catch — dropping the `log p - log q` correction gives TV 0.29 where the correct run
+    # gives 0.03, so anywhere in 1.3x-9x separates them.
+    if tv_inv > 3 * ref_inv:
+        failures.append(f"proposal invariance: TV {tv_inv:.5f} > 3x iid p99 {ref_inv:.5f}")
+    if abs(dz_inv) > 5 * err_inv:
+        failures.append(f"proposal invariance: log Z off by {dz_inv:+.2e}")
+
     stat = dict(zip(exact.paths, exact.log_pi_unnorm, strict=True))
     n_draws = 63
     ranks = sbc_ranks(

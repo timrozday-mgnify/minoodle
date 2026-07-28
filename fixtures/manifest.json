@@ -1,65 +1,65 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "graphs": [
     {
       "name": "chain",
       "file": "chain.npz",
       "k": 5,
       "n_unitigs": 3,
-      "rho": 0.02,
-      "uniform_start": false,
+      "rho": 0.04,
       "beta": 0.05,
       "max_bases": 250,
-      "n_paths": 12,
+      "n_seeds": 60,
+      "n_paths": 184,
       "truncated": 0,
-      "log_Z": 0.4515124470853151,
-      "prior_mass": 1.0,
-      "arrays_sha256": "0d37a37bc5fedd6f50c9534d47e14812267f04bf7089b989d4f8d049f793dfa2"
+      "log_Z": 0.6072616448639572,
+      "prior_mass": 1.0000000000000009,
+      "arrays_sha256": "52ebeba1d860fe4b3cd0ced0de18a9ec31f5e9863bfbf70adad420a3cbe801dd"
     },
     {
       "name": "bubble",
       "file": "bubble.npz",
       "k": 5,
       "n_unitigs": 4,
-      "rho": 0.02,
-      "uniform_start": false,
+      "rho": 0.04,
       "beta": 0.05,
       "max_bases": 250,
-      "n_paths": 20,
+      "n_seeds": 84,
+      "n_paths": 356,
       "truncated": 0,
-      "log_Z": 0.6130705818678392,
-      "prior_mass": 0.9999999999999996,
-      "arrays_sha256": "2c327138559eb7b6f48ce60d254a51b7dde6abe45ebbd71a9c0bc02485c0519d"
+      "log_Z": 0.8632819351892964,
+      "prior_mass": 1.0000000000000004,
+      "arrays_sha256": "b2872cc00ac6d27e36139ff0d571d3ebd0abd9e8d91a1cedd34c4427bafd8907"
     },
     {
       "name": "nested_bubbles",
       "file": "nested_bubbles.npz",
       "k": 5,
       "n_unitigs": 7,
-      "rho": 0.02,
-      "uniform_start": false,
+      "rho": 0.04,
       "beta": 0.05,
       "max_bases": 250,
-      "n_paths": 56,
+      "n_seeds": 144,
+      "n_paths": 1268,
       "truncated": 0,
-      "log_Z": 0.7506254636740923,
-      "prior_mass": 1.0,
-      "arrays_sha256": "180570e3e6a3aaec9af6ee09f31adec7f071fe2060d4728d1034235361d1385f"
+      "log_Z": 1.0539215001634217,
+      "prior_mass": 1.0000000000000004,
+      "arrays_sha256": "7cfd0111eae9c5b41ee9f0f42c5d88fdb2cd5a6235be7a261fde129c6d38e469"
     },
     {
       "name": "repeat_twice",
       "file": "repeat_twice.npz",
       "k": 5,
       "n_unitigs": 4,
-      "rho": 0.02,
-      "uniform_start": false,
+      "rho": 0.04,
       "beta": 0.05,
-      "max_bases": 250,
-      "n_paths": 242,
-      "truncated": 8,
-      "log_Z": 0.6335326314226306,
-      "prior_mass": 0.9999994013761921,
-      "arrays_sha256": "81a8eb04b8fdc028e9efbcbf87fb2c18dde7ad1c09cefce48a3df4495326cb21"
+      "max_bases": 120,
+      "n_seeds": 80,
+      "n_paths": 6432,
+      "truncated": 1432,
+      "log_Z": 0.8295106454260468,
+      "prior_mass": 0.9978597823305411,
+      "arrays_sha256": "f4e2313d4b1c293c4b3cfcee3d26c08d8aa9f9b28aa558336d74417f00f21f80"
     }
   ]
 }

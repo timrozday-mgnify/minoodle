@@ -1,14 +1,30 @@
-# minoodle — implementation plan (rev 8)
+# minoodle — implementation plan (rev 11)
 
 Probabilistic sampling of sequences from a metagenome assembly graph, as an alternative to
 rules-based consensus assembly.
 
 **Audience:** an autonomous coding agent (Claude Code or equivalent) with repo write access.
-**Progress:** M0–M3 complete; each milestone records what shipped, what was deferred, and
+**Progress:** M0–M3.5 complete; each milestone records what shipped, what was deferred, and
 the findings from the run. M4 — likelihood terms, one at a time — is next.
 Note M1's finding 1: the §2.3 prior is implemented as the normalised per-base geometric.
 Note M2's finding 1: the `TV < 0.01` gate is restated against an exact-iid reference band.
 Note M3's finding 1: `metaspades.py -k 21` gives `21M` overlaps, so k = 22 in this codebase.
+Note M3.5's finding 1: `ρ` is 0.04, because expected total length is `2/ρ`.
+**Changes in rev 11:** M3.5 recorded as done, with its five findings — the `mirror` map that
+makes RC symmetry a one-liner, the `ε` importance-weight cap, and the calibration of the
+proposal-invariance gate against the failure it exists to catch.
+**Changes in rev 10:** paths are **two-sided** — a k-mer seed with a left and a right frontier,
+grown by deterministic alternation (§2.1, §2.3, §3.2). The seed is sampled from the reads as a
+**proposal** against a uniform prior (D18, resolved), which supplies §3.3's stratified starts for
+free and keeps the target data-independent. This re-opens M1 and M2, so **M3.5** (§5, new) redoes
+those gates on the two-sided prior before M4 starts.
+Endpoint-conditioned bridging — seeding both mates of a pair and scoring closure — was
+considered and **rejected** for v0; §7 records why.
+**Changes in rev 9:** §2.5 rewritten — the skiver error model is a customisable composable
+context model producing a per-position `[L, 10]` emission table, used for both scoring and
+read simulation; the latent-state HMM layer is an optional component that is usually off; and
+the pair-HMM is demoted to the second of two alignment-marginalisation levels, behind a
+fixed-alignment default (D3 amended). Worked example: `superresolution-amplicon`.
 **Changes in rev 8:** M3 recorded as done, with its five findings — chief among them that
 `-k 21` means k = 22 here; D17 added (external tools run in containers); §5.5.4's environment
 paragraph now names the mechanism.
@@ -61,12 +77,32 @@ Load-bearing. Implement literally; do not "improve" it.
 
 ### 2.1 State space
 
+A path is **two-sided**: a seed position with a left and a right frontier, each extended
+unitig-by-unitig.
+
 ```
-x_t = (v_t, o_t, offset_t)     # oriented unitig visit + extension frontier
-x_{1:t}                        # partial path
+seed  = (v_0, o_0, offset_0)   # a k-mer position: oriented unitig + base offset
+x_t   = (seed, F_L, F_R, s_L, s_R)
+F_L, F_R                       # left/right frontiers, each (v, o, offset)
+s_L, s_R ∈ {open, stopped}     # per-side termination flags
 ```
-plus an absorbing **STOP** state. Extension is unitig-by-unitig; likelihood is evaluated at
-base resolution internally.
+
+Absorbing **STOP** is `s_L = s_R = stopped`. Likelihood is evaluated at base resolution
+internally, as before. Four consequences, each of which something later depends on:
+
+- **Direction alternation is deterministic**, not chosen by the data: step `t` extends the
+  right frontier when `t` is even and the left when odd, skipping a side that is `stopped`.
+  Choosing the direction by likelihood would make the target history-dependent for the same
+  reason §3.3 rules out taboo lists.
+- **The seed is part of the state.** `π` is a distribution over `(seed, path)` pairs; the
+  distribution over *sequences* is its marginal, obtained by the summed-weight deduplication
+  §3.4 already specifies. `Σ p(x) == 1` is therefore checked over `(seed, path)`.
+- **The prior becomes RC-symmetric**, up to the seed's own orientation — M1's finding 3 (prior
+  directional, likelihood RC-symmetric) is the wart this removes. A seed and its reverse
+  complement generate mirror-image path sets with equal prior mass.
+- **Seeds sit mid-unitig.** `offset_0` is a base offset, so a path's endpoints are not forced
+  to unitig boundaries. This is what makes per-branch marginals (§3.4) supportable by any seed
+  near the branch rather than only by seeds upstream of it.
 
 ### 2.2 Target
 
@@ -82,14 +118,58 @@ is defensible; "posterior samples" is not, and the difference costs nothing to s
 
 ### 2.3 Path prior
 
+Two sides, each an independent chain with its own termination:
+
 ```
-p(x) = p_start(x_1) · Π_t [ (1 - ρ)^{len_t} · p_edge(x_{t+1} | x_t) ] · ρ
+p(x) = p_seed(seed) · C(left extensions) · C(right extensions)
+C(side) = Π_t [ (1 - ρ)^{len_t} · p_edge(x_{t+1} | x_t) ] · ρ
 ```
 
-- `p_start` ∝ (unitig length × mean coverage), uniform under a flag.
+- `p_seed` is **uniform over oriented k-mer positions in the graph** (D18). Not
+  coverage-weighted: coverage-proportional seeding is a *proposal*, below. Uniform over
+  *oriented* positions, so a seed and its reverse complement carry equal mass and the
+  RC symmetry of §2.1 holds exactly. The old `p_start ∝ (unitig length × mean coverage)` is
+  retired — its coverage factor moves into `q_seed`, its length factor is what uniform-over-
+  positions already gives you.
 - `p_edge` uniform over out-edges — branch information lives in `L`, not the prior, so
   ablations mean something.
-- `ρ` = per-base stop probability ⇒ geometric length prior.
+- `ρ` = per-base stop probability, applied **per side**. Total length is a sum of two
+  geometrics rather than one, so the length prior is negative-binomial-shaped with mode away
+  from zero. Expected total length is `2/ρ`; keep that in mind before reusing an old `ρ`.
+- Forced STOP at a dead end applies to that side only; the other side keeps going.
+- As in M1's finding 1, this normalises only when the per-base geometric of the prose is
+  implemented (terminal factor `1 - (1-ρ)^{len}` on each side), not the formula read literally.
+
+**Seeding is a proposal, not the prior (D18).** Seeds are drawn from `q_seed` — sample a read
+uniformly, then a k-mer position uniformly from its anchor (§4.1 `index.py` already produces
+the anchors) — and the particle's initial log-weight carries `log p_seed(s) - log q_seed(s)`.
+That keeps the target a fixed, data-independent measure over `(seed, path)` while still
+spending the particle budget where the reads are. It also *is* §3.3 item 5's stratified starts,
+so that deferred item lands here rather than separately.
+
+Four things this costs, all of which have to be handled at M3.5:
+
+- **`q_seed` must be normalised, not just proportional.** Self-normalised weights make the
+  posterior invariant to a constant factor in `q`, but `log Ẑ` is not — and `log Ẑ` is the
+  quantity §3.1 justifies the whole SMC choice with. The normaliser is exactly computable:
+  the total number of anchored read-k-mer placements, which `index.py` already counts.
+- **`q_seed` needs full support.** A graph k-mer with no read anchored on it has `q_seed = 0`
+  and `p_seed > 0`, which biases the estimator rather than merely inflating its variance. Use
+  a mixture `q = (1-ε)·anchored + ε·uniform`, `ε` small but not zero, and assert support before
+  sampling rather than discovering a zero divisor mid-run.
+- **Prior-only `log Ẑ == 0.0` is no longer exact under the coverage proposal.** With `L ≡ 1`
+  the weights are `p_seed/q_seed`, which vary per particle, so `log Ẑ` is 0 only in
+  expectation. Keep the exact test by running it with `q_seed = p_seed` (the uniform-seeding
+  flag) — it stays the sharpest test in the suite, just under a stated configuration.
+- **Proposal invariance becomes testable, and is the better test.** The target does not depend
+  on `q_seed`, so uniform seeding and coverage seeding must give the *same* posterior within
+  Monte Carlo error. That check catches a mis-normalised or partial-support `q` in a way
+  nothing in the current suite does. Add it at M3.5.
+
+**The seeding read is used twice** — once to place the seed, once again when term A scores it.
+Proposal-only seeding makes this a variance/efficiency question rather than a
+double-counting-in-the-target one, since `q` is not part of `π`. Still record it with the
+ablation rather than discovering it in a calibration plot.
 
 ### 2.4 Incremental decomposability — hard constraint
 
@@ -101,10 +181,70 @@ cannot be written this way does not go in v0. Enforced by the ABC in §4.1.
 
 ### 2.5 Term A — read congruence under the skiver error model
 
-**Pair-HMM parameterisation (D3).** skiver gives position-dependent hazard rates and a
-substitution/insertion/deletion spectrum but no indel length distribution. Its
-next-error-depends-on-previous-error structure *is* gap-extend, so the model needs exactly one
-extra number per indel type: `P(error at i+1 | error at i)`.
+**The error model is a customisable per-position emission model, not an HMM.** A fitted skiver
+model is a *composable context model*, specified by a component string —
+`AdditiveContext(N)` or `BaseContext(N)` (required), optionally `+Homopolymer`, `+Strand`,
+`+Position(n)`, `+PhredContext(n)`, `+FragmentOverdispersion`. Which components are in play is
+a per-dataset choice, usually made by fitting a candidate list and keeping the min-AIC winner
+(`superresolution-amplicon`: `bin/build_model_config.py` writes the model-config JSON,
+`skiver/scripts/train_context_error_models.py` fits it, `bin/pick_best_model.py` picks). Treat
+the component set as data, not as something this plan fixes.
+
+Evaluated against a reference sequence the model yields, per reference position, a categorical
+over 10 error types — match, 4 substitutions, 4 insertions, deletion:
+
+```python
+from lib.error_application import ErrorModel, _masked_probs, _CHAR_TO_IDX
+model = ErrorModel.load(model_pt)                                  # trained .pt
+probs = _masked_probs(model._logits_for_reference(ref_idx, is_forward), ref_idx)   # [L, 10]
+```
+
+That `[L, 10]` table is the entire interface, and it runs in both directions:
+
+- **Score** — "were these two sequences produced from the same source, differing only by
+  sequencing error?" Drop the indel mass, renormalise to an `[L, 4]` emission distribution,
+  align the two sequences, and sum the per-column emission log-prob (see the fixed-alignment
+  scorer below). `emission_distribution` / `read_score` in
+  `superresolution-amplicon/bin/subspecies_infer.py`.
+- **Sample** — `lib.error_application.apply_read(model, name, reference, rng, ...)` draws one
+  error type per reference position from the same table and assembles the read, CIGAR and
+  Phred string (quality from a separately fitted `P(Q | error_type)` calibration). This is how
+  synthetic reads are produced; there is no forward/backward pass anywhere in it.
+
+**A latent state is an optional component, and usually absent.** skiver *can* carry a
+read-level latent HMM layer (`_HMMLayer`, `lib.hmm_latent_state`) whose states multiply the
+local error probability by a per-state scale — a quality-regime model, sampled as a state
+trajectory when generating. It is off in the bundled platform presets and in the amplicon
+pipeline. So: code against the `[L, 10]` table, let the layer modulate it when a model has one,
+and do not design anything that assumes latent states exist.
+
+Two constraints that fall out of this and are easy to trip over:
+
+- Not every fitted model is usable generatively. `_reject_unsupported` refuses PhredContext and
+  Position covariates when simulating, because quality and read position are outputs, not
+  inputs. A model trained for scoring may therefore be unusable for P1/P2 read simulation;
+  fit the generative and scoring models from the same data rather than assuming one artefact
+  serves both.
+- The model is conditioned on preceding *consensus* bases, so scoring needs an alignment to
+  supply that context — which is the next decision, and it is separate from the error model.
+
+**Alignment marginalisation — two levels; start at the cheap one.**
+
+1. **Fixed alignment (default).** One edlib alignment (`task="path"`, infix mode so read
+   overhang past the reference is free), sum the per-column emission log-prob, charge a flat
+   `gap_penalty` per indel column, take the better of the two orientations, length-normalise.
+   No HMM, no forward pass, and it is what the amplicon pipeline uses in production
+   (`_oriented_score` / `read_score`).
+2. **Pair-HMM (only if 1 measurably loses information).** States Match / Insert / Delete;
+   match and substitution emissions read off the same `[L, 10]` table; gap-open from the
+   aggregate indel mass; gap-extend from `P(error at i+1 | error at i)` — skiver's
+   next-error-depends-on-previous structure *is* gap-extend, and that conditional is the one
+   number skiver does not emit (D3): P1/P2 take it from the simulator's known parameters, P3
+   measures or fits it from Zymo reads against the reference genomes. Scored by a banded
+   forward around the anchor diagonal.
+
+M4 builds (1) and reports the ablation; (2) is justified by that ablation, not assumed. Level 1
+is an edlib call and a gather-plus-sum; level 2 is where numba would earn its keep.
 
 **Training strategy (D6, D10).** Three phases, each with a known and bounded weakness:
 
@@ -114,16 +254,11 @@ extra number per indel type: `P(error at i+1 | error at i)`.
 | P2 | Simpler skiver model trained on the synthetic data | Robustness to model misspecification | Still generated by the same simulator, so it **bounds** the circularity rather than removing it. This is its value: a controlled misspecification test with a known direction and magnitude. Label it as such. |
 | P3 | skiver trained on real Zymo shotgun reads | Actual performance | The only phase whose numbers can leave the repo. |
 
-Ship each fitted parameter set as versioned TOML tagged with its phase. Every results table
+Ship each fitted model as its artefact set — the `.pt`, the Phred-calibration JSON, and the
+**component string it was fitted with** — versioned and tagged with its phase; the component
+string is part of the model's identity, not a build detail. Every results table
 must state which phase produced it — this is the sort of provenance that gets lost between
 notebook and manuscript and then costs a revision round.
-
-**Pair-HMM construction:**
-- States Match / Insert / Delete; position-dependent match emissions from skiver's hazard
-  rates; substitution emissions from the spectrum matrix; gap-open from aggregate indel rates;
-  gap-extend from the conditional above (P1/P2: from the simulator's known parameters; P3:
-  measured or fitted from Zymo reads against the reference genomes).
-- Read scoring = banded forward algorithm around the anchor diagonal.
 
 **Use a log-odds, not a raw likelihood:**
 
@@ -133,6 +268,14 @@ notebook and manuscript and then costs a revision round.
 with the denominator cached at index time. Without it, term A degenerates into counting reads
 and every particle is rewarded for walking into high-coverage regions regardless of
 correctness.
+
+Under fixed-alignment scoring the denominator has a closed form worth knowing: for a read drawn
+from A, `LLR(A,B)` is a sum of independent per-column terms, so `E[LLR]` is the summed KL
+between the two emission distributions and `Var[LLR]` the summed second moment — no read
+simulation needed. `_llr_moments` / `build_mismapping_matrix` in
+`superresolution-amplicon/bin/subspecies_infer.py` use exactly this to get a mis-mapping matrix
+analytically. Same trick applies here to precompute a rival placement's expected score at index
+time.
 
 Only reads anchored in the newly-added segment contribute at step *t*.
 
@@ -172,6 +315,19 @@ bugs:**
 
 `f_insert` estimated empirically from uniquely-placed pairs during indexing; the D10 values
 are the prior/fallback, not a substitute for measurement.
+
+**Two-sided paths (§2.1) change when this term switches on, and add one bookkeeping rule.**
+
+- A pair straddling the seed resolves within roughly one fragment of step 0 *in either
+  direction*, instead of only forward. That is the whole reason the cold start is short, and it
+  is why seeding both mates of a pair is unnecessary (§7).
+- Fragment distance `d` is measured along the path, across the seed where required: a pair with
+  mate 1 left of the seed and mate 2 right of it is a single `d`, not two.
+- **Score each read exactly once.** For the first few steps the left and right windows both
+  cover the seed unitig. Rule: the seed's own bases are scored once, in `init`'s log increment
+  (which exists for exactly this shape of reason — M1 finding 2); every read thereafter is
+  charged to whichever frontier first extends past it, and a read already charged is never
+  rescored when the other frontier reaches it.
 
 ### 2.7 Term C — coverage (local only in v0)
 
@@ -215,14 +371,28 @@ the useful reading of "MCMC particles".
 ### 3.2 Fully-adapted SMC step
 
 ```
-for each out-edge e:  compute γ(e) exactly
-w_total = logsumexp_e γ(e)
-sample e ~ softmax(γ)
+side = alternate(t)                     # deterministic; skip a stopped side
+alts = out_edges(frontier[side]) + [STOP_side]
+for each a in alts:  compute γ(a) exactly
+w_total = logsumexp_a γ(a)
+sample a ~ softmax(γ)
 log_weight += w_total
 ```
 
 Rao-Blackwellises the branch choice; large variance reduction versus blind branching, at
 `outdegree` (typically ≤ 4) likelihood evaluations per step. Implement from the start.
+
+**The alternative set is per-side and includes that side's STOP** — M2's finding 3 (STOP inside
+the `logsumexp`, not a separate case) applies once per side, not once per step. `STOP_side`
+stops only that frontier; the particle is absorbed when both are stopped. Two rules the
+enumerator and the sampler must agree on *exactly*, since the last divergence between them was
+of this kind:
+
+- **Dead ends.** Zero out-edges ⇒ that side's alternative set is `[STOP_side]` alone, so its
+  γ is forced with weight 0 — not a special case outside the `logsumexp`.
+- **Truncation.** At `max_bases`, drop the over-long extension but still score `STOP_side` by
+  *graph* out-degree, as the one-sided version already requires. The budget is over total
+  path length, so it is reached mid-alternation and the two sides do not hit it symmetrically.
 
 Optional deterministic expansion at outdegree ≤ 2 with resampling doing the pruning
 (beam-search regime, correct weights), gated on a particle-budget cap.
@@ -242,6 +412,10 @@ healthy. That is exactly the failure mode that destroys long-range phasing.
 4. **Island model.** `M` islands × `N` particles, no cross-island resampling. Near-linear
    parallel scaling plus between-island `log Ẑ` spread as a convergence diagnostic.
 5. **Stratified starts** weighted by coverage mass, so low-abundance organisms get budget.
+   Subsumed by read-sampled seeding (§2.3) — sampling the seed from the reads *is* coverage-mass
+   weighting. What remains here is stratification proper: over-sample low-coverage seeds and
+   correct with an importance weight, so a 10²-fold abundance range (R2) does not spend the
+   whole budget on the dominant organism.
 
 **No taboo/visited-node lists.** They make the target history-dependent, so it stops being a
 probability measure. Diversity comes from stratification, islands, and tempering. If genuinely
@@ -267,14 +441,14 @@ Report ESS with every estimate; use inter-island variance rather than asserting 
 minoodle/
   minoodle/
     graph.py          # metaSPAdes GFA parse, bidirected graph, CSR arrays (numpy)
-    index.py          # kmer -> (unitig, offset, strand); read anchors; fragment dist
+    index.py          # kmer -> (unitig, offset, strand); read anchors; q_seed weights
     model/
-      errors.py       # pair-HMM (numba njit forward)
+      errors.py       # skiver emission table + read scoring (§2.5)
       insert.py
       coverage.py
       composite.py
     sampler.py        # SMC engine
-    exact.py          # brute-force enumerator
+    exact.py          # toy graphs, §2.3 prior, seed proposals, brute-force enumerator
     diagnostics.py    # ESS, ancestry, calibration
     cli.py
   tests/
@@ -282,7 +456,8 @@ minoodle/
   bench/
 ```
 
-Stack: numpy for anything array-shaped, **numba** `@njit` for the pair-HMM forward pass and the
+Stack: numpy for anything array-shaped, **numba** `@njit` for the read-scoring inner loop (and a pair-HMM forward, if §2.5
+level 2 is ever needed) and the
 inner SMC weight loop, pytest + hypothesis, pyarrow for output. No pandas in hot paths.
 
 Chopin's `particles` is a poor fit for a custom discrete state space with fully-adapted steps
@@ -302,21 +477,28 @@ class TokenSpace(ABC):
 
 class PathGraph(ABC):
     @abstractmethod
+    def nodes(self) -> list[OrientedNode]: ...
+    @abstractmethod
     def out_edges(self, n: OrientedNode) -> np.ndarray: ...
     @abstractmethod
     def unitig_seq(self, n: OrientedNode) -> bytes: ...
     @abstractmethod
     def unitig_depth(self, n: OrientedNode) -> np.ndarray: ...
+    def seeds(self) -> list[Seed]: ...          # every oriented k-mer position (p_seed support)
 
 class IncrementalLikelihood(ABC):
     """The bounded-window contract from §2.4. If a term can't fit this, it's not in v0."""
     @abstractmethod
-    def init(self, start: OrientedNode) -> State: ...
+    def init(self, seed: Seed) -> tuple[State, float]: ...   # seed unitig's bases, scored once
     @abstractmethod
-    def extend(self, st: State, e: Edge) -> tuple[State, float]: ...  # -> (state, log incr)
+    def extend(self, st: State, e: Edge, side: Side) -> tuple[State, float]: ...
     @abstractmethod
-    def stop_logp(self, st: State) -> float: ...
+    def stop_logp(self, st: State, side: Side) -> float: ...
 ```
+
+Amended at M1 (`init` returns its increment — the seed unitig's own bases are not free) and at
+M3.5 (`Seed` and per-`Side` extension, §2.1). `Side.LEFT`'s frontier is an ordinary *forward*
+walk from `seed.node.flipped()`, so `out_edges`/`new_bases` need no mirrored variants.
 
 Composite likelihood = a list of `IncrementalLikelihood` summing increments. Free ablations by
 composition.
@@ -330,7 +512,7 @@ Cross-language RNG streams will not match, so:
 - **Inject the RNG.** The SMC engine in both languages takes a `uniforms()` source. Tests feed
   a *recorded stream of uniforms* generated once in Python and stored in `fixtures/`. Both
   implementations then produce byte-identical trajectories, ancestries, and weights.
-- **Golden fixtures** for everything deterministic: pair-HMM forward scores, incremental
+- **Golden fixtures** for everything deterministic: read congruence scores, incremental
   log-weights for a fixed (graph, particle) set, resampling indices from a fixed weight vector,
   `log Ẑ` on the M1 toy graphs. Tolerance **1e-9** in log space.
 - Fixtures as `.npz` + JSON manifest with a schema version. Frozen at M6; thereafter the
@@ -578,15 +760,89 @@ uv run python -m minoodle.index check <asm>/assembly_graph_with_scaffolds.gfa R1
    identically. `rc_roundtrip_ok` over every oriented node is the check.
 
 **Deliberately not done:** the *score* of the best competing placement (§2.5) — that needs the
-pair-HMM, so M3 caches the rival placement's identity and vote count and M4 fills in the score.
+§2.5 scorer, so M3 caches the rival placement's identity and vote count and M4 fills in the
+score.
 Minimal perfect hash (the plan already defers it), per-base depth from a pileup (GFA carries one
 number per segment; revisit only if §2.7 wants it), and numba (M6).
+
+### M3.5 — Two-sided paths: redo the M1 and M2 gates ✅ *(done, rev 11)*
+
+Added at rev 10. §2.1 changes the state space, so the exact enumerator and the sampler are both
+invalidated. Doing this before M4 is the point: building six likelihood terms against a state
+space that is about to change means writing each of them twice.
+
+1. `exact.py`: seed enumeration, two-sided `enumerate_paths`, the §2.3 two-geometric prior.
+   `Σ p(x) == 1` now sums over `(seed, path)` — that test is the whole gate for the prior.
+2. Regenerate the golden fixtures. Atom counts rise by roughly the seed multiplicity, so the
+   toy graphs may need shrinking to stay enumerable; prefer shrinking the graphs to loosening
+   the gate.
+3. `sampler.py`: alternation, per-side STOP inside the `logsumexp`, per-side dead ends and the
+   shared `max_bases` budget (§3.2). Prior-only `log Ẑ == 0.0` exactly under uniform seeding
+   (`q_seed = p_seed`) — still the sharpest test, now with a stated configuration.
+4. Seeding as a proposal (D18, resolved): normalised `q_seed` from the anchor counts, the
+   `ε`-mixture for full support, and `log p_seed - log q_seed` in the initial log-weight.
+5. Two new tests that the one-sided formulation could not express:
+   - **RC symmetry.** A seed and its RC give mirror path sets with equal prior mass. This is
+     the check that catches an asymmetric alternation rule.
+   - **Proposal invariance.** Uniform seeding and coverage seeding agree on the posterior
+     within Monte Carlo error, and on `log Ẑ` within its band. This is what catches a
+     mis-normalised or partial-support `q_seed`, and neither of the inherited gates would.
+
+**Gate:** M1's `Σ p(x) == 1` and M2's TV gate (against the exact-iid reference band, per M2
+finding 1) both pass on the two-sided formulation, plus RC symmetry and proposal invariance.
+Do not start M4 on a failing M3.5.
+
+**Watch for:** the M2 blind spot repeating — adaptive resampling never fired on the toy graphs,
+so anything that only runs under degeneracy is covered only by tests that force it. Two-sided
+paths add their own such path (one side stopped, one open); test it explicitly rather than
+hoping a toy graph produces it.
+
+**Shipped:** `Side`/`Seed` and the two-sided `IncrementalLikelihood` in `interfaces.py`;
+`seeds()` on `PathGraph` and `seed_path_seq` in `graph.py`; `seeds`/`next_side`/`mirror`/
+`SeedProposal` and the two-sided enumerator in `exact.py`; seed-proposal sampling, per-side
+STOP and `(nodes, sides)` ancestry in `sampler.py`; `index.seed_weights`. Fixtures
+regenerated at schema version 2. All four gate lines pass at N = 1e5 (`repeat_twice` TV
+0.0709 against an iid p99 of 0.0680), plus RC symmetry exactly and proposal invariance.
+
+**Findings.**
+
+1. **`ρ` is 0.04 now, not 0.02.** Total length is a sum of two geometrics, so mean length is
+   `2/ρ`. 0.04 keeps expected total length where the one-sided fixtures had it. Any `ρ` copied
+   from an M1/M2 artefact is wrong by 2× in length.
+2. **The mirror map is `(seed.flipped(), right, left)` — the walks are untouched.** That falls
+   out of representing the left frontier as an ordinary *forward* walk from
+   `seed.node.flipped()`, which also means no per-side variants of `out_edges` or `new_bases`
+   are needed anywhere. Any other representation makes RC symmetry a case analysis instead of
+   a one-liner; do not change it.
+3. **`ε` caps the importance weight at `1/ε`.** A seed with no anchored read gets `q = ε/n`
+   against `p = 1/n`. That, not "small but not zero", is the number to tune `ε` by: at
+   `ε = 1e-3` a single particle on an unread k-mer carries 1000× weight and dominates `Ẑ`.
+   Default is 0.01; the validation run uses 0.05.
+4. **Proposal invariance needs a looser TV band than the M2 gate, and it was calibrated
+   rather than guessed.** A bad proposal is *supposed* to be less efficient than iid, and the
+   ESS the band is built from is measured after resampling, so it overstates surviving seed
+   diversity. Measured against the failure it exists to catch — dropping `log p - log q` — the
+   correct run gives TV 0.03 and the broken one 0.29, so the gate sits at 3× the iid p99.
+   Note `log Ẑ` does *not* discriminate here: the broken run's was off by only 0.007.
+5. **`repeat_twice`'s budget is deliberately tight (120 bases, 2e-3 of mass truncated).** Two
+   competing pressures resolve the same way: fewer atoms, and truncation loss large enough to
+   *see*. At `max_bases = 250` the lost mass is 8.5e-8, which would hide any enumerator/sampler
+   divergence in the truncation rule — the exact rule those two have historically disagreed on.
+
+**Deferred:** a `prior.py` split (the seed/prior machinery still lives in `exact.py`, which
+`sampler.py` already imported the prior from — revisit if M4 makes that module unwieldy) and
+the `max_bases` story for real graphs, where a unitig can be longer than the budget and
+`run_island` currently raises rather than choosing a policy.
 
 ### M4 — Likelihood terms, one at a time (4–5 days)
 Order, with an ablation after each:
 1. Coverage (§2.7) — should recover the correct branch in an unbalanced bubble.
-2. Single-end congruence with pair-HMM (§2.5), phase P1, plus a gap-extend sensitivity sweep.
-3. Paired-end, resolved (§2.6).
+2. Single-end congruence (§2.5), phase P1: fixed-alignment scoring against the skiver emission
+   table, plus a `gap_penalty` sensitivity sweep. Escalate to the pair-HMM (§2.5 level 2) only
+   if the ablation says fixed alignment is losing information.
+3. Paired-end, resolved (§2.6). Include the seed-straddling case (mate 1 left of the seed,
+   mate 2 right of it, one `d` across the seed) and the score-once rule — both are new at
+   rev 10 and neither appears on a one-sided path.
 4. Paired-end, censored — check it *reduces* spurious long paths.
 5. Stop model (§2.8) — output length distribution must match the prior when data are
    uninformative.
@@ -870,10 +1126,10 @@ change made in response to a real-data finding is validated against L2 and the f
 fixtures locally *before* it goes back to the cluster.
 
 ### M6 — Python performance ceiling and fixture freeze (2 days) — *after M5a*
-- numba the pair-HMM forward and the weight loop; multiprocessing across islands.
+- numba the read-scoring loop and the weight loop; multiprocessing across islands.
 - Store paths as ancestry pointers into a shared arena, not copied lists — the difference
   between 1e4 and 1e6 particles.
-- Profile before optimising. Expect the pair-HMM to dominate.
+- Profile before optimising. Expect read scoring (alignment + emission lookup) to dominate.
 - **Freeze golden fixtures** per §4.2.
 
 **Gate:** L2 and L3 run end-to-end in Python within tolerable wall clock; fixtures frozen.
@@ -898,7 +1154,7 @@ Instantiate `TokenSpace` with `(w, k)` minimizer tuples à la mdbg; reuse
 caveats not to paper over:
 
 1. **The error model changes.** A single base error usually destroys a minimizer, appearing as
-   a *deletion* in minimizer space, not a substitution. The pair-HMM must be re-parameterised
+   a *deletion* in minimizer space, not a substitution. The error model must be re-parameterised
    on minimizer-space error statistics — derivable from skiver's base-space model by
    simulation, but not reusable as-is.
 2. **Coverage semantics change.** Minimizer-space depth is not base depth. Re-derive the
@@ -935,6 +1191,9 @@ original motivation — need §7.
 9. Do not mix inner distance and fragment length (§2.6).
 10. Do not run anything on HPC that has not passed its `--smoke` config locally (§5.5.4), and
     do not go back to the cluster for a diagnostic that should have been written by default.
+11. Do not pick the extension direction using the data (§2.1). Alternation is deterministic;
+    "extend whichever side looks more promising" makes the target history-dependent, which is
+    the same defect as a taboo list (§3.3) wearing different clothes.
 
 ---
 
@@ -946,6 +1205,16 @@ original motivation — need §7.
 - **Global coverage deconvolution** as an outer loop (§2.7 v1): conditional SMC + abundance
   fitting + residual coverage. The route to strain-level resolution and the strongest
   differentiator against BayesPaths.
+- **Endpoint-conditioned bridging SMC** — seed both mates of a pair and grow toward closure.
+  Considered at rev 10 and rejected for v0, recorded because it is an idea that recurs. It does
+  not do what it looks like it does: two disjoint frontiers have no fragment distance `d`
+  between them, so no paired-end term exists until they meet, and steering extension toward a
+  known target is data-dependent construction of the kind §3.3 rules out. It is a genuinely
+  different algorithm — conditioning on both endpoints — not a change of start point. The cold
+  start it was meant to fix is short anyway: two-sided paths (§2.1) activate term B within
+  ~one fragment either side of the seed, and §2.6 caps paired-end reach at ~100–250 bp beyond
+  the reads, so pairs were never the long-range discriminator. Revisit only with a proper
+  bridging formulation and an importance weight for the conditioning, not as a seeding tweak.
 - Particle Gibbs / conditional SMC with ancestor sampling for long-range phasing.
 - Annealed SMC (tempering) for tangled regions.
 - Emitting indel continuation probabilities from skiver directly.
@@ -959,7 +1228,12 @@ original motivation — need §7.
 **Resolved:**
 - **D1** Python first, Rust port for performance, Python as test oracle (§4.2 for the contract).
 - **D2** metaSPAdes GFA canonical.
-- **D3** No indel length distribution from skiver; gap-extend obtained per §2.5.
+- **D3** (amended rev 9) The error model is skiver's composable context model, not an HMM —
+  a customisable component string giving a per-position emission table; a latent-state layer
+  is optional and normally unused. Read scoring defaults to fixed alignment (edlib) plus a
+  flat gap penalty; the Match/Insert/Delete pair-HMM is level 2, taken only on ablation
+  evidence. skiver emits no indel length distribution, so if level 2 is reached, gap-extend
+  comes from `P(error at i+1 | error at i)` per §2.5.
 - **D4** k=21.
 - **D5** Minimizer sequences as output; base-space reconstruction deferred.
 - **D6** Phased error-model strategy P1 → P2 → P3 (§2.5). P2 bounds the circularity rather
@@ -986,6 +1260,13 @@ original motivation — need §7.
   alongside the outputs — a tag is not a version. Settled at M3, where metaSPAdes 4.3.0 ran as
   `quay.io/biocontainers/spades@sha256:2af76c9b…` and its provenance was written to
   `asm/provenance.json` next to the GFA.
+- **D18** Read-sampled seeding is a **proposal**, not the prior. `p_seed` is uniform over
+  oriented k-mer positions; `q_seed` is coverage-weighted via the read anchors, normalised by
+  the total anchored placement count, mixed with `ε` uniform for full support, and corrected by
+  `log p_seed - log q_seed` in the initial log-weight (§2.3). The target therefore stays
+  data-independent, seeding strategy becomes a pure efficiency knob, and swapping `q_seed`
+  gives a testable invariance rather than a different posterior. Cost: prior-only
+  `log Ẑ == 0.0` is exact only under uniform seeding, so that test now names its configuration.
 
 **Open:**
 - **D14 (blocks M5):** Which run, from the 18 candidate BioSamples in §5.5.2c. Selection

@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import pytest
 
-from minoodle.exact import GCBias, bubble, chain, nested_bubbles, repeat_twice
+from minoodle.exact import GCBias, bubble, chain, mirror, nested_bubbles, repeat_twice
 from minoodle.graph import UnitigGraph, code, decode, rc_roundtrip_ok, revcomp
-from minoodle.interfaces import OrientedNode
+from minoodle.interfaces import OrientedNode, Seed, Side
 
 TOYS = [chain(), bubble(), nested_bubbles(), repeat_twice()]
 
@@ -59,22 +59,27 @@ def test_rc_roundtrip(toy):
 
 @pytest.mark.parametrize("toy", TOYS, ids=lambda g: g.name)
 def test_likelihood_is_rc_symmetric(toy):
-    """M1 finding 3: the *likelihood* is RC-symmetric; the prior is not, so this is over L."""
+    """Two-sided, a state and its `mirror` score equally — see `test_exact.py` for the prior.
+
+    Here it is just the likelihood, walked by hand through the ABC, so the term itself is
+    checked independently of the enumerator that also walks it.
+    """
     g = as_unitig_graph(toy)
     term = GCBias(g, beta=0.7)
 
-    def log_l(path: tuple[OrientedNode, ...]) -> float:
-        st, total = term.init(path[0])
-        for n in path[1:]:
-            st, incr = term.extend(st, n)
-            total += incr
-        return total + term.stop_logp(st)
+    def log_l(seed: Seed, left, right) -> float:
+        st, total = term.init(seed)
+        for side, walk in ((Side.LEFT, left), (Side.RIGHT, right)):
+            for n in walk:
+                st, incr = term.extend(st, n, side)
+                total += incr
+        return total + term.stop_logp(st, Side.LEFT) + term.stop_logp(st, Side.RIGHT)
 
     for a in g.nodes():
+        seed = Seed(a, 0)
         for m in g.out_edges(a):
-            path = (a, decode(int(m)))
-            rc = tuple(n.flipped() for n in reversed(path))
-            assert log_l(path) == pytest.approx(log_l(rc), abs=1e-12)
+            state = (seed, (), (decode(int(m)),))
+            assert log_l(*state) == pytest.approx(log_l(*mirror(g, state)), abs=1e-12)
 
 
 def test_kmer_coverage_converted_to_base_coverage(tmp_path):

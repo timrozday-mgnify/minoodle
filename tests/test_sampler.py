@@ -16,8 +16,10 @@ from minoodle.exact import (
     chain,
     enumerate_paths,
     nested_bubbles,
+    uniform_seed_proposal,
+    weighted_seed_proposal,
 )
-from minoodle.interfaces import CompositeLikelihood, OrientedNode
+from minoodle.interfaces import CompositeLikelihood, OrientedNode, Seed
 from minoodle.sampler import SMCConfig, branch_marginals, run, run_island, sbc_ranks
 
 ACYCLIC = (chain, bubble, nested_bubbles)
@@ -29,7 +31,7 @@ ENTRY = {e["name"]: e for e in MANIFEST["graphs"]}
 def _fixture_run(factory, n=2000, islands=2, seed=0):
     g = factory()
     e = ENTRY[g.name]
-    params = PriorParams(e["rho"], e["uniform_start"])
+    params = PriorParams(e["rho"])
     lik = GCBias(g, e["beta"])
     cfg = SMCConfig(n, islands, e["max_bases"], seed=seed)
     return g, e, run(g, lik, params, cfg), enumerate_paths(g, lik, params, e["max_bases"])
@@ -52,18 +54,45 @@ def test_two_node_chain_posterior_matches_the_closed_form():
     """Independent hand calculation on A→B, so the sampler is not checked only against the
     enumerator it is supposed to be validating."""
     g = build("pair", 5, [(0, 1)], [6, 4], seed=9)
-    params = PriorParams(rho=0.05, uniform_start=True)
+    params = PriorParams(rho=0.05)
     r = run(g, CompositeLikelihood([]), params, SMCConfig(40_000, 1, 10_000, seed=5))
     post = r.posterior()
 
     a, b = OrientedNode(0, True), OrientedNode(1, True)
     q = 1 - params.rho
-    start = 1 / 4  # 2 unitigs x 2 orientations, uniform
-    len_a = len(g.unitig_seq(a))
+    p_seed = 1 / len(g.seeds())
+    span = len(g.unitig_seq(a)) - g.k
 
-    assert post[(a,)] == pytest.approx(start * (1 - q**len_a), abs=0.005)
-    assert post[(a, b)] == pytest.approx(start * q**len_a, abs=0.005)
-    assert post[(b,)] == pytest.approx(start, abs=0.005)  # B forward is a dead end
+    # A's twin is a dead end so the left frontier always stops at the seed; the right frontier
+    # either stops inside A's remaining bases or walks A's single out-edge into dead-end B.
+    seed = Seed(a, 3)
+    assert post[(seed, (), ())] == pytest.approx(p_seed * (1 - q ** (span - 3)), abs=0.002)
+    assert post[(seed, (), (b,))] == pytest.approx(p_seed * q ** (span - 3), abs=0.002)
+
+
+def test_a_seed_flush_with_a_unitig_end_must_extend():
+    """`pending == 0` on a side that is not a dead end: the terminal factor is 0, so STOP
+    carries no mass and the alternative set is the out-edges alone — without ever special-casing
+    it out of the `logsumexp`."""
+    g = build("pair", 5, [(0, 1)], [6, 4], seed=9)
+    a, b = OrientedNode(0, True), OrientedNode(1, True)
+    seed = Seed(a, len(g.unitig_seq(a)) - g.k)
+    r = run(g, CompositeLikelihood([]), PriorParams(rho=0.05), SMCConfig(20_000, 1, 10_000))
+    post = r.posterior()
+    assert (seed, (), ()) not in post
+    assert post[(seed, (), (b,))] == pytest.approx(1 / len(g.seeds()), abs=0.002)
+
+
+def _tv_budget(exact, r, slack=2.0):
+    """TV an iid sampler of the same ESS would incur, times `slack`.
+
+    A flat threshold cannot work across these graphs: two-sided states multiply by the seed
+    count, so `repeat_twice` has 6432 atoms where the one-sided version had 242, and a perfect
+    sampler's TV is dominated by that atom count (M2 finding 1). The gate scales with it.
+    """
+    ess = sum(diag.ess(i.log_w) for i in r.islands)
+    _, hi = diag.multinomial_tv_reference(exact.pi, max(1, int(ess)))
+    return slack * hi
 
 
 @pytest.mark.parametrize("factory", TOY_GRAPHS)
@@ -74,7 +103,7 @@ def test_matches_the_exact_fixture(factory):
     This catches bugs, not the last digit.
     """
     _, e, r, exact = _fixture_run(factory, n=2000, islands=2)
-    assert diag.tv_distance(r.posterior(), exact.posterior()) < 0.12
+    assert diag.tv_distance(r.posterior(), exact.posterior()) < _tv_budget(exact, r)
     assert r.log_Z == pytest.approx(e["log_Z"], abs=0.05)
 
 
@@ -85,6 +114,41 @@ def test_branch_marginals_agree_with_the_enumeration(factory):
     assert set(got) <= set(want)
     for key, w in want.items():
         assert got.get(key, 0.0) == pytest.approx(w, abs=0.06)
+
+
+def test_the_posterior_does_not_depend_on_the_seed_proposal():
+    """§5 M3.5's proposal-invariance check, the one neither inherited gate could express.
+
+    `q_seed` is not part of the target (D18), so a skewed proposal must reproduce the uniform
+    one's posterior. Drop the `log p_seed - log q_seed` correction and TV against the exact
+    answer goes from ~0.03 to ~0.29, which is the margin this threshold sits inside.
+    """
+    g = bubble()
+    lik = GCBias(g, 0.05)
+    exact = enumerate_paths(g, lik, DEFAULT_PRIOR, 250)
+    cfg = SMCConfig(20_000, 2, 250, seed=12)
+
+    rng = np.random.default_rng(4)
+    w = 10.0 ** rng.uniform(0, 1, len(g.seeds()))
+    w[rng.random(w.size) < 0.1] = 0.0  # seeds only the eps mixture keeps on support
+    skewed = run(g, lik, DEFAULT_PRIOR, cfg, proposal=weighted_seed_proposal(g, w, eps=0.05))
+    uniform = run(g, lik, DEFAULT_PRIOR, cfg)
+
+    assert diag.tv_distance(skewed.posterior(), exact.posterior()) < 0.1
+    assert diag.tv_distance(skewed.posterior(), uniform.posterior()) < 0.1
+    assert skewed.log_Z == pytest.approx(exact.log_Z, abs=0.05)
+
+
+def test_one_side_stopped_while_the_other_grows():
+    """The degenerate regime two-sided paths introduce, in the sampler rather than only the
+    enumerator — the M2 blind spot (a code path no toy graph exercised) repeating in a new
+    place is exactly what §5 M3.5 says to watch for."""
+    g = nested_bubbles()
+    r = run(g, GCBias(g, 0.05), DEFAULT_PRIOR, SMCConfig(2000, 1, 250, seed=13))
+    states = r.islands[0].paths()
+    assert any(left and not right for _, left, right in states)
+    assert any(right and not left for _, left, right in states)
+    assert any(len(left) > 1 and len(right) > 1 for _, left, right in states)
 
 
 def test_systematic_resample_is_stratified_and_deterministic():
@@ -125,15 +189,18 @@ def test_recorded_uniforms_replay_identically():
 
     d1, n1 = replay()
     d2, n2 = replay()
-    a = run_island(g, lik, DEFAULT_PRIOR, cfg, d1)
-    b = run_island(g, lik, DEFAULT_PRIOR, cfg, d2)
-    # The contract is not just "reproducible" but "predictable position": N draws per step plus
-    # one per resampling, everything from the injected source and nothing from a private RNG.
+    q = uniform_seed_proposal(g)
+    a = run_island(g, lik, DEFAULT_PRIOR, cfg, d1, q)
+    b = run_island(g, lik, DEFAULT_PRIOR, cfg, d2, q)
+    # The contract is not just "reproducible" but "predictable position": N for the seeds, N per
+    # step, one more per resampling, everything from the injected source and nothing private.
     steps = a.nodes.shape[0]
     resamples = sum(1 for p in a.parents if not np.array_equal(p, np.arange(p.size)))
+    # `resamples` undercounts: systematic resampling on near-uniform weights can return the
+    # identity permutation. `ess_frac=1.0` is what guarantees the draw actually happens.
     assert resamples > 0
     assert n1() == n2()
-    assert steps * cfg.n_particles < n1() <= steps * (cfg.n_particles + 1)
+    assert n1() == (steps + 1) * cfg.n_particles + steps
     assert a.log_Z == b.log_Z
     assert np.array_equal(a.log_w, b.log_w)
     assert np.array_equal(a.nodes, b.nodes)
@@ -169,13 +236,13 @@ def test_resampling_every_step_is_still_unbiased(factory):
     resamplings, the state permutation and the ancestry bookkeeping all have to be right."""
     g = factory()
     e = ENTRY[g.name]
-    params, lik = PriorParams(e["rho"], e["uniform_start"]), GCBias(g, e["beta"])
+    params, lik = PriorParams(e["rho"]), GCBias(g, e["beta"])
     cfg = SMCConfig(4000, 2, e["max_bases"], ess_frac=1.0, seed=6)
     r = run(g, lik, params, cfg)
     assert any(not np.array_equal(p, np.arange(p.size)) for p in r.islands[0].parents)
     assert r.log_Z == pytest.approx(e["log_Z"], abs=0.08)
     exact = enumerate_paths(g, lik, params, e["max_bases"])
-    assert diag.tv_distance(r.posterior(), exact.posterior()) < 0.2
+    assert diag.tv_distance(r.posterior(), exact.posterior()) < _tv_budget(exact, r)
 
 
 def test_heavy_truncation_matches_the_enumerator():

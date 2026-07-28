@@ -22,9 +22,11 @@ import argparse
 import gzip
 import statistics
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+
+import numpy as np
 
 from minoodle.graph import UnitigGraph, code, decode, revcomp
 from minoodle.interfaces import OrientedNode
@@ -96,6 +98,40 @@ class KmerIndex:
         rival = ranked[1] if len(ranked) > 1 else None
         return Anchor(node, diagonal, n_votes, rival[0][0] if rival else None,
                       rival[1] if rival else 0)
+
+
+def seed_weights(index: KmerIndex, reads: Iterable[bytes]) -> np.ndarray:
+    """Anchored k-mer placements per seed, in `graph.seeds()` order — the `q_seed` weights (D18).
+
+    Every k-mer of an anchored read votes for the seed position it lands on. The total is
+    exactly the normaliser §2.3 asks for, and `weighted_seed_proposal` divides by it; nothing
+    here needs to be a probability.
+
+    **Both orientations are credited.** A read anchors on one strand, but `Seed(n, o)` and its
+    flip are two distinct states of an RC-symmetric target. Weighting only the strand the read
+    happened to come off would leave half the state space on the `eps` floor for no reason.
+    """
+    graph = index.graph
+    starts: dict[OrientedNode, int] = {}
+    total = 0
+    for n in graph.nodes():
+        starts[n] = total
+        total += len(graph.unitig_seq(n)) - index.k + 1
+    w = np.zeros(total)
+
+    for read in reads:
+        a = index.anchor(read)
+        if a is None:
+            continue
+        node = decode(a.node)
+        span = len(graph.unitig_seq(node)) - index.k
+        flip = node.flipped()
+        for j in range(len(read) - index.k + 1):
+            o = a.diagonal + j
+            if 0 <= o <= span:  # reads may overhang a unitig end
+                w[starts[node] + o] += 1.0
+                w[starts[flip] + span - o] += 1.0
+    return w
 
 
 def read_fastq(path: Path) -> Iterator[bytes]:

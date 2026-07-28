@@ -36,13 +36,30 @@ from pathlib import Path
 
 import numpy as np
 
-from minoodle.interfaces import OrientedNode, PathGraph
+from minoodle.interfaces import OrientedNode, PathGraph, Seed
 
 _COMPLEMENT = bytes.maketrans(b"ACGT", b"TGCA")
 
 
 def revcomp(seq: bytes) -> bytes:
     return seq.translate(_COMPLEMENT)[::-1]
+
+
+def seed_path_seq(
+    graph: PathGraph,
+    seed: Seed,
+    left: tuple[OrientedNode, ...],
+    right: tuple[OrientedNode, ...],
+) -> bytes:
+    """Assemble a two-sided path (§2.1).
+
+    `right` is a forward walk out of `seed.node`, `left` a forward walk out of
+    `seed.node.flipped()` — so the left walk's sequence is the answer read backwards, and the
+    two overlap on the whole seed unitig rather than on `k-1` bases.
+    """
+    seed_len = len(graph.unitig_seq(seed.node))
+    left_seq = revcomp(graph.path_seq((seed.node.flipped(),) + left))
+    return left_seq[: len(left_seq) - seed_len] + graph.path_seq((seed.node,) + right)
 
 
 def code(n: OrientedNode) -> int:
