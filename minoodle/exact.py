@@ -8,8 +8,9 @@ there is no way to tell "the sampler works" from "the sampler produces plausible
     python -m minoodle.exact write --out fixtures
     python -m minoodle.exact verify fixtures/manifest.json
 
-Toy graphs live here rather than in a `graph.py` because they are fixtures: M3's metaSPAdes
-GFA loader is a different thing and gets its own module.
+Toy graphs live here rather than in `graph.py` because they are fixtures: the metaSPAdes GFA
+loader is a different thing and has its own module. `revcomp`/`code`/`decode` live there —
+the CSR arrays are what `code` was always for.
 
 **Prior normalisation.** §2.3 is written as `p_start · Π_t [(1-ρ)^{len_t} · p_edge] · ρ`, which
 does not sum to 1 over paths — the trailing `ρ` stops at a unitig boundary having already
@@ -36,24 +37,10 @@ from typing import Any
 
 import numpy as np
 
+from minoodle.graph import code, decode, revcomp
 from minoodle.interfaces import Edge, IncrementalLikelihood, OrientedNode, PathGraph
 
 FIXTURE_SCHEMA_VERSION = 1
-
-_COMPLEMENT = bytes.maketrans(b"ACGT", b"TGCA")
-
-
-def revcomp(seq: bytes) -> bytes:
-    return seq.translate(_COMPLEMENT)[::-1]
-
-
-def code(n: OrientedNode) -> int:
-    """Pack an oriented node into an int, as the M3 CSR arrays will."""
-    return 2 * n.unitig + int(n.forward)
-
-
-def decode(c: int) -> OrientedNode:
-    return OrientedNode(c >> 1, bool(c & 1))
 
 
 class ToyGraph(PathGraph):
@@ -95,16 +82,6 @@ class ToyGraph(PathGraph):
 
     def unitig_depth(self, n: OrientedNode) -> np.ndarray:
         return np.full(len(self._seqs[n.unitig]), self._depths[n.unitig])
-
-    def new_bases(self, n: OrientedNode, first: bool) -> int:
-        """Bases `n` contributes to the path sequence: all of them if it starts the path."""
-        return len(self._seqs[n.unitig]) - (0 if first else self.k - 1)
-
-    def path_seq(self, path: tuple[OrientedNode, ...]) -> bytes:
-        out = self.unitig_seq(path[0])
-        for n in path[1:]:
-            out += self.unitig_seq(n)[self.k - 1 :]
-        return out
 
 
 def _joints(n_unitigs: int, edges: list[tuple[int, int]]) -> list[int]:
@@ -232,7 +209,7 @@ class GCBias(IncrementalLikelihood):
     reverse complement it makes the §5 M3 RC-symmetry test bite.
     """
 
-    def __init__(self, graph: ToyGraph, beta: float = 0.05):
+    def __init__(self, graph: PathGraph, beta: float = 0.05):
         self.graph = graph
         self.beta = beta
 

@@ -51,7 +51,13 @@ class TokenSpace(ABC):
 
 
 class PathGraph(ABC):
-    """The assembly graph as the sampler sees it (§4.1)."""
+    """The assembly graph as the sampler sees it (§4.1).
+
+    `k` is the overlap convention: consecutive unitigs on a path share `k-1` bases. Note that
+    metaSPAdes `-k 21` writes `21M` overlaps, so its graphs are `k = 22` here (§5 M3).
+    """
+
+    k: int
 
     @abstractmethod
     def out_edges(self, n: OrientedNode) -> np.ndarray: ...
@@ -64,6 +70,16 @@ class PathGraph(ABC):
         """Per-base depth. Note §5 M3: metaSPAdes `cov`/`KC:i` are k-mer based and must be
         converted by `L/(L-k+1)` before use, or the §2.7 NegBin mean is systematically wrong.
         """
+
+    def new_bases(self, n: OrientedNode, first: bool) -> int:
+        """Bases `n` contributes to the path sequence: all of them if it starts the path."""
+        return len(self.unitig_seq(n)) - (0 if first else self.k - 1)
+
+    def path_seq(self, path: tuple[OrientedNode, ...]) -> bytes:
+        out = self.unitig_seq(path[0])
+        for n in path[1:]:
+            out += self.unitig_seq(n)[self.k - 1 :]
+        return out
 
 
 class IncrementalLikelihood(ABC):

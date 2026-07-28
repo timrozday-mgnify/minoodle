@@ -15,16 +15,20 @@ decisions (§8).
 
 ## Current status
 
-**M0, M1, M2 done.** `minoodle/interfaces.py` (§4.1 ABCs + `CompositeLikelihood`),
+**M0–M3 done.** `minoodle/interfaces.py` (§4.1 ABCs + `CompositeLikelihood`),
 `minoodle/simdata.py` (genome-blender adapter + manifest with P1/P2/P3 phase tag;
 `datasets/L0.yaml` regenerates bit-identically), `minoodle/exact.py` (toy graphs, §2.3 prior,
-brute-force enumerator, golden fixtures in `fixtures/`) and `minoodle/sampler.py` +
-`minoodle/diagnostics.py` (SMC, validated against those fixtures). **M3 (metaSPAdes GFA and
-index) is next.**
+brute-force enumerator, golden fixtures in `fixtures/`), `minoodle/sampler.py` +
+`minoodle/diagnostics.py` (SMC, validated against those fixtures), and `minoodle/graph.py` +
+`minoodle/index.py` (GFA loader, CSR bidirected graph, k-mer index and anchors).
+**M4 (likelihood terms, one at a time) is next.**
 
 ```bash
 uv run python -m minoodle.exact verify fixtures/manifest.json
 uv run python -m minoodle.sampler validate fixtures/manifest.json   # the M2 gate, ~5 s
+uv run python -m minoodle.graph stats ~/Documents/minoodle_run/L0/asm/assembly_graph_with_scaffolds.gfa
+uv run python -m minoodle.index check ~/Documents/minoodle_run/L0/asm/assembly_graph_with_scaffolds.gfa \
+    ~/Documents/minoodle_run/L0/sim_reads_R{1,2}.fastq.gz     # the M3 gate, ~1.5 s
 ```
 
 Things earlier milestones settled that later code depends on:
@@ -45,9 +49,19 @@ Things earlier milestones settled that later code depends on:
 - Adaptive resampling never fires on the toy graphs (ESS stays ≥ 0.84 N), so that code path is
   only covered by tests that force it with `ess_frac=1.0`. Watch for the same blind spot when
   adding anything that only runs under degeneracy.
+- **`metaspades.py -k 21` writes `21M` overlaps, so `k` is 22 in this codebase** (M3 finding 1).
+  `UnitigGraph.from_gfa` infers k from the `L` lines and asserts against any k you pass; don't
+  hard-code it. `KC/DP` on a metaSPAdes segment equals `L-k+1`, which confirms the same k.
+- The `cov_base = cov_kmer · L/(L-k+1)` conversion is implemented as §5 M3 specifies, but it is
+  a ~2.9× multiplier at L0's median unitig length and unbounded as `L → k` (M3 finding 2). M4
+  item 1 decides what §2.7 does about short unitigs; don't silently change the formula.
+- The anchor table caches the rival placement's *identity and votes*, not §2.5's competing
+  **score** — that needs the pair-HMM and lands with M4.
 
 Follow the plan's milestone order (§5) — M1 before the sampler, M6 (fixture freeze) before any
-Rust port, etc. Milestones are hard gates: do not proceed past a failing one.
+Rust port, etc. Milestones are hard gates: do not proceed past a failing one. As of rev 7 the
+order is `M4 → M5a (synthetic ladder) → M6 → M7 (Rust) → M5b (real data, HPC) → M9`: the
+real-data rungs run on the Rust build, under the §5.5.4 HPC discipline.
 
 CI landed at M2 (`.github/workflows/ci.yml` runs ruff, pytest, `exact verify` and the full
 sampler gate). Still deferred: mypy (M3/M4, once the type surface stops moving), `bench/` (M6),
@@ -65,6 +79,20 @@ uv run python -m minoodle.simdata verify ~/Documents/minoodle_run/L0/manifest.js
 
 genome-blender is invoked as a shell command from its own conda env (`generate_reads_cmd` in the
 dataset YAML), not imported — the two projects share no environment.
+
+Every *other* external tool runs in a container, never a local install (D17): biocontainers
+under Docker locally, singularity via the nextflow pipeline on HPC. Record the image **digest**,
+not the tag. M3's assembly, and the pattern to copy:
+
+```bash
+docker run --rm --platform linux/amd64 -v "$PWD:/data" \
+  quay.io/biocontainers/spades:4.3.0--hde4eca7_0 \
+  metaspades.py --only-assembler -k 21 \
+  -1 /data/sim_reads_R1.fastq.gz -2 /data/sim_reads_R2.fastq.gz -o /data/asm
+```
+
+Provenance (image digest, command, output hashes) goes next to the outputs — see
+`~/Documents/minoodle_run/L0/asm/provenance.json`.
 
 Manifests hash file *content*: `.gz` outputs are hashed decompressed, because gzip's header
 mtime otherwise makes byte-identical reads look non-reproducible. genome-blender at

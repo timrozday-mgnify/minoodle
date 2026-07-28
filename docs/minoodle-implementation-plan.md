@@ -1,13 +1,14 @@
-# minoodle — implementation plan (rev 6)
+# minoodle — implementation plan (rev 7)
 
 Probabilistic sampling of sequences from a metagenome assembly graph, as an alternative to
 rules-based consensus assembly.
 
 **Audience:** an autonomous coding agent (Claude Code or equivalent) with repo write access.
-**Progress:** M0, M1 and M2 complete; each milestone records what shipped, what was deferred, and
-the findings from the run. M3 — metaSPAdes GFA and index — is next.
+**Progress:** M0–M3 complete; each milestone records what shipped, what was deferred, and
+the findings from the run. M4 — likelihood terms, one at a time — is next.
 Note M1's finding 1: the §2.3 prior is implemented as the normalised per-base geometric.
 Note M2's finding 1: the `TV < 0.01` gate is restated against an exact-iid reference band.
+Note M3's finding 1: `metaspades.py -k 21` gives `21M` overlaps, so k = 22 in this codebase.
 **Changes in rev 6:** candidate R2 accessions recorded; §5.5.2c verification protocol added.
 **Changes in rev 5:** D11-D13 resolved; §5.5.2a (R2 in-scope set) and §5.5.2b
 (reference verification) added; D14-D15 opened.
@@ -337,6 +338,20 @@ Cross-language RNG streams will not match, so:
 
 Hard gates. Do not proceed past a failure.
 
+**Order note (rev 7).** M5 is split. The synthetic ladder (**M5a**, §5.5.1) runs on the
+Python implementation; the real-data ladder (**M5b**, §5.5.2) does **not**. Optimisation —
+M6 (Python ceiling + fixture freeze) and M7 (Rust port) — sits between them:
+
+```
+M4 → M5a (synthetic ladder) → M6 → M7 → M5b (real-data ladder) → M8? → M9
+```
+
+Reason: R1–R4 are HPC-sized and each iteration costs a queue wait, so entering them on the
+slow implementation buys nothing but wall clock. M8 (minimizer space) stays after M5b and is
+still to be avoided — reach for it only if M7's measured throughput leaves M5b infeasible,
+and record the measurement that forced it. §5.5.4 is the HPC discipline that keeps the
+round-trips down; read it before writing any M5b code.
+
 ### M0 — Skeleton and data (0.5–1 day) — **DONE**
 - Package, CI, ruff/mypy, pytest, bench harness.
 - ABCs from §4.1 with stubs.
@@ -478,18 +493,26 @@ these graphs for them to fix. Add when a real graph shows early-locus ESS collap
 uniform streams are consumed through the injected seam and the draw count is asserted, but no
 stream is committed as a fixture yet; that is M6's freeze (§4.2).
 
-### M3 — metaSPAdes GFA and index (2–3 days)
+### M3 — metaSPAdes GFA and index (2–3 days) — **DONE**
 
-Per D2/D7/D8, run metaSPAdes as: `metaspades.py --only-assembler -k 21 -1 R1.fq -2 R2.fq`.
+Per D2/D7/D8, run metaSPAdes as: `metaspades.py --only-assembler -k 21 -1 R1.fq -2 R2.fq`,
+in a container rather than from a local install (D17):
+
+```bash
+docker run --rm --platform linux/amd64 -v "$PWD:/data" \
+  quay.io/biocontainers/spades:4.3.0--hde4eca7_0 \
+  metaspades.py --only-assembler -k 21 \
+  -1 /data/sim_reads_R1.fastq.gz -2 /data/sim_reads_R2.fastq.gz -o /data/asm
+```
 
 Consequences to handle explicitly:
 
 - **`--only-assembler` skips BayesHammer**, which is what we want: the §2.5 likelihood scores
   raw reads, and pre-corrected reads would have had some of the errors the skiver model exists
   to describe already removed. Record in the run config that correction was skipped.
-- **Single-k with `-k 21`** gives GFA overlaps at k−1 = 20, consistent throughout. Verify the
-  run completes in metagenomic mode; if metaSPAdes rejects single-k, fall back to Bifrost or
-  Cuttlefish for the k=21 graph and keep metaSPAdes as a comparator only.
+- **Single-k with `-k 21`** was expected to give GFA overlaps at k−1 = 20. It does not — see
+  finding 1: the overlaps are 21M, so this project's k is 22. metaSPAdes accepted single-k in
+  metagenomic mode, so the Bifrost/Cuttlefish fallback was not needed.
 - **metaSPAdes still simplifies the graph** — tip clipping, bubble removal, chimera filtering —
   even with `--only-assembler`, which only skips read correction. That removes some of the
   uncertainty this project exists to sample. Document as a known limitation; if results look
@@ -505,6 +528,54 @@ Then: k-mer index (dict → later minimal perfect hash), read anchor table with 
 best-competing-placement scores, fragment-length estimation, per-unitig depth arrays.
 
 **Gate:** graph loads; RC round-trip passes; anchor recall ≥ 99% on error-free reads.
+**Passed:** 156 unitigs / 222 links load from L0, RC round-trip OK, **recall 100.00%** on all
+20 000 L0 reads (99.77% of them uniquely), in 1.5 s.
+
+**What shipped.** `minoodle/graph.py`: `UnitigGraph` (CSR `indptr`/`indices` over oriented-node
+codes, same method surface as `ToyGraph` so the sampler and enumerator run against a real graph
+unchanged), `from_gfa`/`to_gfa`, the k-mer→base coverage conversion, `rc_roundtrip_ok`, and a
+`stats` subcommand. `revcomp`/`code`/`decode` moved here from `exact.py`, and `new_bases`/
+`path_seq`/`k` moved *up* into the `PathGraph` ABC, where both implementations shared them
+verbatim. `minoodle/index.py`: `KmerIndex` (canonical k-mer → oriented placements, occurrence
+cap), diagonal-voting `anchor`, `fragment_length`, and the `check` subcommand that is the gate.
+Assembly provenance (image digest, command, GFA hashes) is written next to the GFA as
+`asm/provenance.json`.
+
+```bash
+uv run python -m minoodle.graph stats <asm>/assembly_graph_with_scaffolds.gfa
+uv run python -m minoodle.index check <asm>/assembly_graph_with_scaffolds.gfa R1.fq.gz R2.fq.gz
+```
+
+**Findings:**
+
+1. **`metaspades.py -k 21` writes `21M` overlaps, so k = 22 here.** SPAdes' unitigs are paths
+   of (k+1)-mers; consecutive segments share 21 bases, not 20. Every downstream use of "k−1
+   overlap" therefore means 22−1. `from_gfa` reads k off the `L` lines and *asserts* against
+   any k passed in rather than trusting it — passing `--k 21` fails loudly, which is how this
+   was found. The same arithmetic sets the coverage conversion: `KC/DP` is exactly `L−k+1`
+   with k = 22, which independently confirms it.
+2. **The coverage conversion blows up on short unitigs.** `cov_base = cov_kmer · L/(L−k+1)` is
+   a factor of ~2.9 at the median unitig length (32 bp, k = 22) and unbounded as `L → k`.
+   Implemented as specified, but §2.7's NegBin will see wildly over-dispersed depths on short
+   unitigs unless M4 either weights by k-mer span or works in k-mer coverage directly. Decide
+   at M4 item 1, with the number in front of you; do not quietly change the formula here.
+3. **The L0 graph is not a single path** — 156 unitigs, 222 links, 122 of 312 oriented nodes
+   with out-degree > 1, from one 100 kb genome with error-free reads. k = 22 collapses every
+   repeat longer than 21 bp, so even the "trivial" rung has branching for M4's terms to
+   discriminate. Total segment length 101 330 vs a 100 260 bp genome, as expected once shared
+   overlaps are counted twice.
+4. **Fragment length measures 397.5 (var 9 658) against a planted 400 (var 10 000)** on 8 907
+   FR pairs — the estimator is right, with the mild downward bias you would predict from
+   measuring only pairs that fit inside one unitig. §2.6's "estimate empirically, the D10
+   numbers are a prior" is therefore doing real work rather than confirming an assumption.
+5. **No twin `L` lines.** metaSPAdes writes each bidirected edge once; the loader installs the
+   twin `(v,¬ov) → (u,¬ou)` itself and deduplicates, so a GFA that *does* write both parses
+   identically. `rc_roundtrip_ok` over every oriented node is the check.
+
+**Deliberately not done:** the *score* of the best competing placement (§2.5) — that needs the
+pair-HMM, so M3 caches the rival placement's identity and vote count and M4 fills in the score.
+Minimal perfect hash (the plan already defers it), per-base depth from a pileup (GFA carries one
+number per segment; revisit only if §2.7 wants it), and numba (M6).
 
 ### M4 — Likelihood terms, one at a time (4–5 days)
 Order, with an ablation after each:
@@ -521,7 +592,15 @@ Order, with an ablation after each:
 on a two-species synthetic set. If a term doesn't, report it — a term that doesn't help is a
 finding, not a tuning target.
 
-### M5 — Benchmarks and calibration (4–5 days)
+### M5a — Synthetic ladder and calibration (3–4 days)
+
+Everything in §5.5.1, on the Python implementation, local. This is where the calibration
+machinery of §5.5.3 is *built and debugged*, because a synthetic rung is cheap to rerun and a
+real one is not. M5b reuses the same code and changes only the inputs.
+
+**Gate:** calibration within tolerance on L0–L2; documented failure modes on L3; the metric
+suite of §5.5.3 runs end-to-end from a manifest with no interactive steps (the §5.5.4
+requirement). Then go to M6 — do not start any R-rung.
 
 #### 5.5.1 Synthetic ladder (development)
 
@@ -534,6 +613,16 @@ conserved stretches means near-identical paths everywhere. Debug on the lower ru
 | L1 | two divergent genomes, 10:1 abundance | low-abundance organism still sampled |
 | L2 | 3–5 species' 16S, shared conserved regions | the real ambiguity test |
 | L3 | 3 small genomes (~5 Mb) | performance, memory |
+
+### M5b — Real-data ladder (4–5 days, mostly HPC wall clock) — *after M7*
+
+Runs on the Rust implementation from M7, against the frozen M6 fixtures. Prerequisites:
+M6 gate passed, M7 gate passed, §5.5.4 harness in place. Gate is at the end of §5.5.3.
+
+The cheap, local, non-HPC parts of this milestone — accession resolution (§5.5.2c step 1),
+reference-bundle diff (step 2), sylph triage (step 3), the expected-coverage partition
+(step 4) and the §5.5.2b pre-flight — are **pull-forward work**: none depends on the sampler,
+so do them during M6/M7 while compute is idle. They resolve D14/D15, which block M5b.
 
 #### 5.5.2 Real-data ladder (D9)
 
@@ -573,9 +662,10 @@ D6300 that I'd want to hard-code here. Concrete leads:
   ILLUMINA + WGS, and pick a run with 2×150 and adequate depth. Record the accession in the
   data manifest so runs are reproducible.
 
-**Task for M5:** run skiver on the selected real dataset to produce the P3 error model (D10),
-and re-estimate the fragment distribution from it — the 400 ± 100 assumption is a prior, and
-the real library will differ.
+**Task for M5b, pulled forward:** run skiver on the selected real dataset to produce the P3
+error model (D10), and re-estimate the fragment distribution from it — the 400 ± 100 assumption
+is a prior, and the real library will differ. This needs reads but not the sampler, so do it
+during M6/M7; M4 item 6's P2 → P3 comparison then has its P3 side ready the moment M7 lands.
 
 #### 5.5.2a R2 as primary (D12) — two things that must be handled first
 
@@ -723,28 +813,79 @@ N50 is not a metric here, and no assembly-contiguity number should appear in any
 - `log Ẑ` spread across islands and seeds.
 - Recovery rate as a function of organism abundance (specifically for R2).
 
-**Gate:** §5.5.2b pre-flight complete and its outcome recorded; calibration within tolerance
-on L0–L2 and R1; recovery reported conditional on the R2 in-scope set; documented failure
-modes on L3 and on the R2 marginal set.
+**M5b gate:** §5.5.2b pre-flight complete and its outcome recorded; calibration within
+tolerance on R1; recovery reported conditional on the R2 in-scope set; documented failure modes
+on the R2 marginal set. (L0–L2 calibration and L3 failure modes are M5a's gate, already passed.)
 
-### M6 — Python performance ceiling and fixture freeze (2 days)
+#### 5.5.4 HPC execution discipline — design for few round-trips
+
+M5b's iteration cost is a queue wait, not a runtime. The engineering goal is to make each
+HPC visit answer as many questions as possible and to make local reproduction of a remote
+failure possible without a second visit.
+
+**One artefact, one command.** A run is `minoodle sample` (§4/M9) plus a config file and a
+manifest — no interactive steps, no notebook, no "then I ran this bit by hand". Whatever is
+needed to produce a results table must be reachable from the manifest alone. M5a's gate
+enforces this while it is still cheap to fix.
+
+**Batch the ladder, don't walk it.** Submit R1, R2 and the R4 rungs as one job array over the
+(dataset × seed × island-count) grid, with independent outputs, rather than running a rung and
+deciding what to do next. A failed cell in an array is one cell; a failed serial rung is a
+whole round-trip.
+
+**Fail fast, locally, first.** Every config gets a `--smoke` run — the same code path, tiny
+particle count, one locus — that must pass on the dev machine before submission. Most remote
+failures are path, environment and config errors, and those cost a full queue wait each if the
+first thing the cluster does is a real run. Job scripts run the smoke config as step 0 and
+abort the array on failure.
+
+**Ship diagnostics, not just results.** Each run writes, unconditionally: per-locus ESS
+traces, `log Ẑ` per island, resampling event counts, wall clock and peak RSS per phase, plus
+the exact config and both git SHAs. The question "why did that run behave oddly" must be
+answerable from downloaded output. Re-running remotely to add a diagnostic is the single most
+expensive mistake available in this milestone.
+
+**Deterministic replay of any remote particle.** The §4.2 injected-uniforms seam already
+allows this: a run records its uniform stream (or the seed plus stream position for a chosen
+lineage), so a suspicious remote trajectory replays bit-identically in the local Python
+oracle. Keep the recorded stream small — one lineage, not the whole run — and write it on
+demand via a config flag, not by default.
+
+**Environment pinned, not rebuilt.** Per D17: every external tool is a container, run locally
+under Docker (biocontainers) and on HPC under singularity via the nextflow pipeline, with the
+**image digest** — not the tag — recorded next to the outputs. Do not debug a compiler or a
+dependency resolver at the front of a queue.
+
+**Estimate before submitting.** M7's scaling curve gives time and memory per (particles ×
+bases × unitigs). Use it to set walltime and memory requests; a job killed at the limit at
+hour 11 is the worst possible outcome and is entirely avoidable arithmetic.
+
+**Small-data proxy kept green.** L2 stays runnable locally in minutes throughout M5b. Any
+change made in response to a real-data finding is validated against L2 and the frozen M6
+fixtures locally *before* it goes back to the cluster.
+
+### M6 — Python performance ceiling and fixture freeze (2 days) — *after M5a*
 - numba the pair-HMM forward and the weight loop; multiprocessing across islands.
 - Store paths as ancestry pointers into a shared arena, not copied lists — the difference
   between 1e4 and 1e6 particles.
 - Profile before optimising. Expect the pair-HMM to dominate.
 - **Freeze golden fixtures** per §4.2.
 
-**Gate:** L2 and R1 run end-to-end in Python within tolerable wall clock; fixtures frozen.
+**Gate:** L2 and L3 run end-to-end in Python within tolerable wall clock; fixtures frozen.
+R1 is no longer part of this gate — it has moved to M5b, which is after the port. Substitute
+an L3-scale extrapolation to R1's graph size instead of running R1 itself.
 
-### M7 — Rust port (4–5 days)
+### M7 — Rust port (4–5 days) — *before the real-data ladder*
 Same module structure, traits mirroring the ABCs. Validated exclusively against M6 fixtures
 with the injected-uniforms scheme.
 
 **Gate:** every fixture matches to 1e-9; scaling curve over cores and particle count
-documented. Rough target, to revise with M5's numbers: 1e5 particles × 1e4 bases on a
-1e6-unitig graph, under an hour on 16 cores, under 32 GB.
+documented. Rough target, to revise with M5a's numbers: 1e5 particles × 1e4 bases on a
+1e6-unitig graph, under an hour on 16 cores, under 32 GB. The scaling curve is not optional
+paperwork — §5.5.4 sizes every HPC job request from it. If the curve says an R-rung will not
+fit, that measurement is what justifies pulling M8 forward; nothing else does.
 
-### M8 — Minimizer space (3 days)
+### M8 — Minimizer space (3 days) — *avoid unless M7's numbers force it*
 Instantiate `TokenSpace` with `(w, k)` minimizer tuples à la mdbg; reuse
 `~/Documents/rust-mdbg` for graph construction. Nothing in the sampler changes.
 
@@ -769,6 +910,8 @@ original motivation — need §7.
 - Weighted FASTA + Parquet sidecar: sequence id, log weight, normalised weight, path node
   list, per-term likelihood decomposition, error-model phase tag.
 - Seed everything; log full config.
+- `--smoke` (tiny run, same code path) and the unconditional diagnostic bundle of §5.5.4.
+  These are needed *at M5b*, so build them there and let M9 only tidy the surface.
 
 ---
 
@@ -780,9 +923,13 @@ original motivation — need §7.
 4. No parameter tuning against the benchmark before calibration gates pass.
 5. Do not skip M1.
 6. Do not report N50 or contig-style metrics as evidence the method works.
-7. Do not start the Rust port before M6.
+7. Do not start the Rust port before M6, and do not start the real-data ladder (M5b) before
+   M7 — a queue wait per iteration on the slow implementation is the most expensive way
+   available to find a bug the synthetic ladder would have caught.
 8. Do not quote P1 or P2 numbers outside the repo (§2.5).
 9. Do not mix inner distance and fragment length (§2.6).
+10. Do not run anything on HPC that has not passed its `--smoke` config locally (§5.5.4), and
+    do not go back to the cluster for a diagnostic that should have been written by default.
 
 ---
 
@@ -826,6 +973,14 @@ original motivation — need §7.
 - **D12** R2 (log-distribution) is the primary real-data rung. R1 stays as the calibration
   baseline — see §5.5.2a for why both are needed and for the in-scope-set procedure.
 - **D13** Reference genomes taken as exact, subject to the §5.5.2b pre-flight verification.
+- **D16** Optimisation goes between the ladders: M5a → M6 → M7 → M5b. The real-data rungs are
+  HPC-bound, so they run on the Rust implementation; §5.5.4 governs how. M8 stays deferred and
+  is only pulled forward on evidence from M7's scaling curve.
+- **D17** External tools run in containers, never local installs: biocontainers under Docker
+  locally, singularity via the nextflow pipeline on HPC (§5.5.4). Record the image **digest**
+  alongside the outputs — a tag is not a version. Settled at M3, where metaSPAdes 4.3.0 ran as
+  `quay.io/biocontainers/spades@sha256:2af76c9b…` and its provenance was written to
+  `asm/provenance.json` next to the GFA.
 
 **Open:**
 - **D14 (blocks M5):** Which run, from the 18 candidate BioSamples in §5.5.2c. Selection
