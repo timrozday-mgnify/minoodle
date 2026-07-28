@@ -1,0 +1,2 @@
+# minoodle
+Probabilistic metagenomic assembly
