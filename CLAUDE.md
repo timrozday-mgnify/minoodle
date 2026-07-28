@@ -15,15 +15,18 @@ decisions (§8).
 
 ## Current status
 
-**M0–M3.5 done.** `minoodle/interfaces.py` (§4.1 ABCs + `CompositeLikelihood`, `Side`, `Seed`),
+**M0–M3.5 done. M4 item 1 (coverage) is built and toy-validated but its L1 gate fails —
+see the findings below before touching it.** `minoodle/interfaces.py` (§4.1 ABCs +
+`CompositeLikelihood`, `Side`, `Seed`),
 `minoodle/simdata.py` (genome-blender adapter + manifest with P1/P2/P3 phase tag;
 `datasets/L0.yaml` regenerates bit-identically), `minoodle/exact.py` (toy graphs, §2.3 prior,
 seed proposals, brute-force enumerator, golden fixtures in `fixtures/`), `minoodle/sampler.py` +
 `minoodle/diagnostics.py` (SMC, validated against those fixtures), and `minoodle/graph.py` +
-`minoodle/index.py` (GFA loader, CSR bidirected graph, k-mer index, anchors, seed weights).
-**M4 (likelihood terms, one at a time) is next.** Plan rev 10 changed the state space and M3.5
-redid the M1 and M2 gates on it: a path is a k-mer **seed** with a **left and a right frontier**,
-alternated deterministically, each with its own STOP (§2.1–2.3, §3.2).
+`minoodle/index.py` (GFA loader, CSR bidirected graph, k-mer index, anchors, seed weights), and
+`minoodle/model/coverage.py` (§2.7's Gamma–Poisson term + its L1 ablation).
+**M4 item 2 (single-end read congruence, §2.5) is next.** Plan rev 10 changed the state space
+and M3.5 redid the M1 and M2 gates on it: a path is a k-mer **seed** with a **left and a right
+frontier**, alternated deterministically, each with its own STOP (§2.1–2.3, §3.2).
 
 ```bash
 uv run python -m minoodle.exact verify fixtures/manifest.json
@@ -31,6 +34,7 @@ uv run python -m minoodle.sampler validate fixtures/manifest.json   # the M2 gat
 uv run python -m minoodle.graph stats ~/Documents/minoodle_run/L0/asm/assembly_graph_with_scaffolds.gfa
 uv run python -m minoodle.index check ~/Documents/minoodle_run/L0/asm/assembly_graph_with_scaffolds.gfa \
     ~/Documents/minoodle_run/L0/sim_reads_R{1,2}.fastq.gz     # the M3 gate, ~1.5 s
+uv run python -m minoodle.model.coverage ablate ~/Documents/minoodle_run/L1 --hazard 0.05 0.2
 ```
 
 Things earlier milestones settled that later code depends on:
@@ -90,11 +94,49 @@ Things earlier milestones settled that later code depends on:
 - **`metaspades.py -k 21` writes `21M` overlaps, so `k` is 22 in this codebase** (M3 finding 1).
   `UnitigGraph.from_gfa` infers k from the `L` lines and asserts against any k you pass; don't
   hard-code it. `KC/DP` on a metaSPAdes segment equals `L-k+1`, which confirms the same k.
-- The `cov_base = cov_kmer · L/(L-k+1)` conversion is implemented as §5 M3 specifies, but it is
-  a ~2.9× multiplier at L0's median unitig length and unbounded as `L → k` (M3 finding 2). M4
-  item 1 decides what §2.7 does about short unitigs; don't silently change the formula.
 - The anchor table caches the rival placement's *identity and votes*, not §2.5's competing
-  **score** — that needs the §2.5 read scorer and lands with M4.
+  **score** — that needs the §2.5 read scorer and lands with M4 item 2.
+- **Every likelihood term is scored as a log-odds against a null, not as a raw likelihood**
+  (M4 item 1 finding 2). §2.5 states this for reads; it is not specific to reads. A raw
+  `log p(·)` is a flat per-unitig toll on *extending* against a STOP that costs nothing, so
+  the term stops arguing about which branch and starts arguing with the length prior — on L1
+  the posterior collapsed to single-unitig paths. Coverage's null is the same count under the
+  prior alone.
+- **`cov_kmer → cov_base` is the constant `R/(R−k+1)`** in the read length, *not* `L/(L−k+1)`
+  (M4 item 1 finding 1, closing M3 finding 2 — measured to two decimals on L0). `read_len` is
+  a `UnitigGraph` knob, since no assembler records it. §2.7's term avoids the conversion
+  altogether by working in k-mer counts against a `L−k+1` exposure (`unitig_kmer_cov`), which
+  is also what stops short unitigs looking wildly overdispersed.
+- **The coverage term pays for looping instead of preventing it** (M4 item 1 finding 6, the
+  root cause of the runaway). Successive traversals of one unitig score +1.566, +1.672, +1.720,
+  +1.748, +1.766 nats — each loop cheaper than the last — because the running posterior has
+  already absorbed that unitig's own count, so re-scoring it is a match against its own
+  evidence. On `repeat_twice` with the repeat at 1× the flanks (should be traversed once) the
+  posterior mode is **6 traversals**; at 2× (should be twice) it puts 0.89 on *avoiding the
+  repeat entirely*, and 4× is indistinguishable from 2×. There is no copy-number signal at all.
+  The fix is a multiplicity model — score `y ~ NegBin(c·λ·m)` for the traversal count `c` the
+  path assigns, and never update λ from a unitig already counted — which collides with the
+  bounded window, so it is **parked in §2.4 as that section's open question**, with three
+  candidate resolutions written out there. Do not bound the increment with a constant instead. `test_repeat_traversal_is_self_confirming`
+  pins the broken behaviour deliberately; when the fix lands, rewrite it to assert the opposite.
+- **Coverage alone does not terminate, and M4 item 1's L1 gate FAILS because of it** (finding
+  3): the increment is unbounded above (+37 nats on one L1 unitig), so it out-argues the
+  `O(ρ)`-per-base geometric stop and the walk runs away — `log Ẑ` +46 567 with an island
+  spread of 21 952 at `h = 0.05`, 8 595 unitigs/path at `h = 0.2`. No hazard rescues it. The
+  term *is* validated against the exact enumerator on the toy graphs (157:1 on the unbalanced
+  bubble against a 1:1 prior); it is the real-graph target that isn't usable. Item 4's censored
+  pairs are the plan's own fix. Do not tune the hazard to make the gate pass, and do not patch
+  §2.8 to compensate.
+- **Small-N runs of the coverage term look fine and are wrong.** 400 particles gave 1.95
+  unitigs/path and a plausible 0.950 → 0.982; 4 000 particles found the runaway. Read
+  `unitigs/path` and the island spread before any accuracy number.
+- **`branch_marginals` is not a probability once paths are long** — it accumulates per
+  traversal, so the runaway arms report total branch mass of 2 317 against the prior arm's
+  1.73. Ratios still mean something; absolute values do not.
+- Coverage **starves the rare organism** on L1: the 1× organism gets no posterior mass at its
+  branch points at all, in every coverage arm. Recorded as a finding, not a tuning target
+  (§5 M4's gate says so explicitly). It is an abundance signal and needs a per-read term
+  beside it.
 - skiver's error model is **not** an HMM: it is a customisable composable context model whose
   component string is per-dataset, evaluated to a per-position `[L, 10]` emission table used
   for both scoring and read simulation. A latent-state layer is an optional component and is
@@ -120,6 +162,12 @@ Generated data lives outside the repo, in `~/Documents/minoodle_run/<dataset>/`:
 uv run python -m minoodle.simdata run datasets/L0.yaml --out ~/Documents/minoodle_run/L0
 uv run python -m minoodle.simdata verify ~/Documents/minoodle_run/L0/manifest.json
 ```
+
+`L0` is one genome, error-free. `L1` (§5.5.1) is the two-species 10:1 rung M4's per-term gate
+needs — Prevotella at 10×, a Clostridia contig at 1×, same fragment/read parameters as L0.
+Ground truth on a real graph is `index.reference_walk`: the reference's k-mers run back through
+the k-mer index, giving the unitig walk with gaps where a k-mer is absent or ambiguous. No
+aligner is involved and none is needed.
 
 genome-blender is invoked as a shell command from its own conda env (`generate_reads_cmd` in the
 dataset YAML), not imported — the two projects share no environment.

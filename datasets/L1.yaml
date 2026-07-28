@@ -1,0 +1,43 @@
+# L1 — §5.5.1 second rung: two divergent genomes at 10:1, no errors.
+# Gate: the low-abundance organism is still sampled. Also §5 M4's per-term gate — the
+# ablations need a set where the ground-truth path is known and coverage actually varies.
+
+name: L1
+error_model_phase: P1
+
+# genome-blender lives in its own conda env; this is the command, not an import dependency.
+generate_reads_cmd: >-
+  /Users/timrozday/miniforge3/envs/genome_blender_dev/bin/python
+  /Users/timrozday/Documents/genome-blender/generate_reads.py
+
+# Different phylum, different GC (Bacteroidota ~45% vs Firmicutes_A ~28%), so the two are
+# divergent in the §5.5.1 sense — this is the abundance test, not the ambiguity test (that is
+# L2, where the shared conserved regions are the point).
+genomes:
+  - genome_id: MGYG000290000_1
+    fasta_path: refs/MGYG000290000_1.fna     # Prevotella sp902792635, 100,260 bp
+    abundance: 10
+  - genome_id: MGYG000000001_3
+    fasta_path: refs/MGYG000000001_3.fna     # GCA-900066495 sp902362365, 104,897 bp
+    abundance: 1
+
+genome_blender:
+  num_reads: 60000              # ~82x major, ~8x minor over ~100 kb each at 2x150
+  fragment_mean: 400.0          # FRAGMENT LENGTH = outer distance (§2.6), per D10
+  fragment_variance: 10000.0    # sd 100, per D10
+  read_length_mean: 150.0
+  read_length_variance: 0.0
+  paired_end: true
+  error_model: none
+  seed: 43
+
+notes:
+  - "10:1 by abundance, which at these near-equal genome lengths is 10:1 by depth as well —
+     the separation §2.7's coverage term is meant to see."
+  - "refs/MGYG000000001_3.fna is contig 3 of MGYG000000001.fna, MGnify human-gut catalogue
+     v2.0.2 (https://ftp.ebi.ac.uk/pub/databases/metagenomics/mgnify_genomes/human-gut/v2.0.2/
+     species_catalogue/MGYG0000000/MGYG000000001/genome/MGYG000000001.fna,
+     sha256 05e57b4b44d1b4203ee9e3d5d53b0a49e24150ec5a6ae7261eee7fe5f6d4073f). Contig 3 is
+     104,897 bp, the closest in size to L0's reference."
+  - "error_model: none — like L0. Errors arrive with §5 M4 item 2 and the P1 tag records that
+     they come from the same skiver model genome-blender simulates with (§2.5)."

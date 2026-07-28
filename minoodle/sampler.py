@@ -83,7 +83,7 @@ class SMCConfig:
 
     n_particles: int = 1000
     n_islands: int = 4
-    max_bases: int = 250
+    max_bases: int | None = 250  # None: unbounded, which is what a real graph needs (M4)
     ess_frac: float = 0.5
     seed: int = 0
 
@@ -183,6 +183,10 @@ def run_island(
     proposal: SeedProposal,
 ) -> IslandResult:
     n = cfg.n_particles
+    # A real unitig is longer than any budget worth setting (L0's longest is 13.6 kb), so the
+    # budget is optional. Termination is still a.s. under the geometric prior (§2.8) — the
+    # bound is a fixture convenience, not what stops a path.
+    budget = math.inf if cfg.max_bases is None else cfg.max_bases
     lp_seed = seed_logp(graph)
     log_q = proposal.log_q
 
@@ -201,10 +205,9 @@ def run_island(
     for i, j in enumerate(idx0):
         seed = proposal.seeds[j]
         seed_len = len(graph.unitig_seq(seed.node))
-        if seed_len > cfg.max_bases:
-            # ponytail: `enumerate_paths` drops these seeds outright, so a proposal that can
-            # reach one targets a different measure. Toy graphs never do. M4 revisits when
-            # real unitigs meet a real budget — probably by making `max_bases` unbounded.
+        if seed_len > budget:
+            # `enumerate_paths` drops these seeds outright, so a proposal that can reach one
+            # targets a different measure. Toy graphs never do; real graphs run unbounded.
             raise ValueError(f"seed unitig {seed_len} bp exceeds max_bases {cfg.max_bases}")
         st, incr = likelihood.init(seed)
         seeds.append(seed)
@@ -241,7 +244,7 @@ def run_island(
                 for c in out:
                     nxt = decode(int(c))
                     nb = graph.new_bases(nxt, first=False)
-                    if total[i] + nb > cfg.max_bases:
+                    if total[i] + nb > budget:
                         continue  # dropped, exactly as `enumerate_paths` drops it
                     st2, incr = likelihood.extend(state[i], nxt, side)
                     gammas.append(base + incr)

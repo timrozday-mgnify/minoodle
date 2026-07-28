@@ -1,15 +1,26 @@
-# minoodle — implementation plan (rev 11)
+# minoodle — implementation plan (rev 12)
 
 Probabilistic sampling of sequences from a metagenome assembly graph, as an alternative to
 rules-based consensus assembly.
 
 **Audience:** an autonomous coding agent (Claude Code or equivalent) with repo write access.
-**Progress:** M0–M3.5 complete; each milestone records what shipped, what was deferred, and
-the findings from the run. M4 — likelihood terms, one at a time — is next.
+**Progress:** M0–M3.5 complete; M4 item 1 (coverage) is implemented and validated against the
+exact enumerator on the toy graphs, but **its L1 gate fails for a diagnosed structural reason**
+(item 1 finding 6 — at a repeat the term pays for looping instead of preventing it, so any
+cycle runs away and §2.8's termination is defeated). Each milestone records what shipped, what
+was deferred, and the findings from the run. M4 item 2 — single-end read congruence — is next;
+M4's milestone gate is not met until §2.4's open multiplicity question is answered.
 Note M1's finding 1: the §2.3 prior is implemented as the normalised per-base geometric.
 Note M2's finding 1: the `TV < 0.01` gate is restated against an exact-iid reference band.
 Note M3's finding 1: `metaspades.py -k 21` gives `21M` overlaps, so k = 22 in this codebase.
 Note M3.5's finding 1: `ρ` is 0.04, because expected total length is `2/ρ`.
+Note M4 item 1's finding 2: **every** term is scored as a log-odds, not just §2.5's.
+**Changes in rev 12:** M4 item 1 built and recorded with seven findings and a **failing L1
+gate** — chief among them that the coverage term *pays* for traversing a repeat again rather
+than preventing it (finding 6), which §2.4 now carries as an open question. Also: the
+k-mer→base coverage conversion corrected to the constant `R/(R−k+1)` (closing M3 finding 2),
+§2.5's log-odds rule generalised to every term, coverage starving the rare organism, and
+`branch_marginals` ceasing to be a probability once paths are long. `datasets/L1.yaml` added.
 **Changes in rev 11:** M3.5 recorded as done, with its five findings — the `mirror` map that
 makes RC symmetry a one-liner, the `ε` importance-weight cap, and the calibration of the
 proposal-invariance gate against the failure it exists to catch.
@@ -179,6 +190,34 @@ log π(x_{1:t+1}) - log π(x_{1:t}) = γ_t(x_{1:t+1})
 computable in bounded time from the last `W = max_fragment + read_len` bases. Any term that
 cannot be written this way does not go in v0. Enforced by the ABC in §4.1.
 
+**Open: unitig multiplicity vs the bounded window.** M4 item 1 finding 6 measured the first
+real collision with this constraint. §2.7 as written asks "is this unitig's depth consistent
+with `λ`", which is bounded-window and wrong: the running posterior absorbs the unitig's own
+count, so re-traversing it scores *better* each time (+1.566, +1.672, +1.720, … nats on
+`repeat_twice`) and the term pays for looping instead of preventing it. Preventing looping is
+the other question — "how many traversals would make this unitig's depth consistent with `λ`",
+i.e. score `y ~ NegBin(c · λ · m)` for the multiplicity `c` the path assigns and never update
+`λ` from a unitig already counted — and **`c` is a property of the whole path**, so an exact
+version needs per-unitig counts over unbounded history. That is precisely what this section
+forbids.
+
+Three ways out, to be decided before M4's gate can be met:
+
+1. **Window-bounded multiplicity.** Keep counts only for unitigs seen within the last `W`
+   bases. Catches short cycles, which are the ones that run away; a repeat re-entered from
+   further off is scored as new. Stays inside §2.4 by construction, and is the default unless
+   the ablation says otherwise.
+2. **Multiplicity as part of the state, not the history.** Carry `c` per unitig in the particle
+   and accept state that grows with the number of *distinct* unitigs visited. Bounded per step
+   but not per path — a weakening of §2.4 that must be written down as such, not slipped in.
+3. **Leave coverage local and let another term stop the looping.** §2.6's censored pairs (M4
+   item 4) already have the job of suppressing spurious long paths. Cheapest, and it keeps
+   §2.7 honest about being local self-consistency only — but it leaves copy number unmodelled,
+   and finding 6 shows the term cannot tell 2× from 4× at all.
+
+Do not resolve this by bounding the per-unitig increment with a constant: that changes the
+target to fit a gate (§6 anti-goal 4).
+
 ### 2.5 Term A — read congruence under the skiver error model
 
 **The error model is a customisable per-position emission model, not an HMM.** A fitted skiver
@@ -344,6 +383,25 @@ junctions) are possible but penalised — otherwise one bad estimate kills a pat
 
 v1 (deferred, §7): outer loop — sample a path set, fit abundances by NNLS/EM against observed
 unitig depths, subtract explained coverage, resample against the residual.
+
+**As built at M4 item 1 — read this before implementing the paragraph above literally.** Three
+corrections, each measured; the full write-ups are under §5 M4 item 1.
+
+- **Units.** Not per-base depth: k-mer *counts* `y = cov_kmer · (L−k+1)` against a k-mer-span
+  exposure. The `L/(L−k+1)` conversion §5 M3 specified is wrong (finding 1), and counts avoid
+  needing any conversion.
+- **Log-odds, not raw likelihood.** `γ` is the Bayes factor against the same count under the
+  prior alone. As a raw `log p(y)` the term is a flat toll on extending and collapses the
+  posterior onto single-unitig paths (finding 2). §2.5 states this rule for reads; it is not
+  specific to reads.
+- **It does not prevent looping — as specified it rewards it** (finding 6), and the fix is
+  §2.4's open multiplicity question. Nothing in this section as written models copy number,
+  and the built term cannot tell a 2× repeat from a 4× one.
+
+The prediction in this section's first paragraph — that conflating the local and global terms
+"starves low-abundance ones" — held even with only the local term: on L1 the 1× organism got no
+posterior mass at its branch points at all (finding 5). Coverage is an abundance signal, so it
+needs a per-read term beside it.
 
 ### 2.8 Termination
 
@@ -705,8 +763,8 @@ Consequences to handle explicitly:
   uncertainty this project exists to sample. Document as a known limitation; if results look
   suspiciously clean, this is the first thing to check.
 - **Coverage units:** metaSPAdes' `cov` in the segment name and the `KC:i:` tag are k-mer
-  based, not base coverage. Convert with `L/(L-k+1)` before feeding §2.7 or the NegBin mean is
-  systematically wrong.
+  based, not base coverage. Convert before use — but with `R/(R-k+1)` in the *read* length, not
+  the `L/(L-k+1)` written here originally; see M4 item 1 finding 1, which measures it.
 - **Bidirected orientation handling** (`+`/`-`, reverse complement) is the most common source of
   silent bugs. Property test: every path and its reverse complement must receive identical
   likelihood.
@@ -746,6 +804,8 @@ uv run python -m minoodle.index check <asm>/assembly_graph_with_scaffolds.gfa R1
    Implemented as specified, but §2.7's NegBin will see wildly over-dispersed depths on short
    unitigs unless M4 either weights by k-mer span or works in k-mer coverage directly. Decide
    at M4 item 1, with the number in front of you; do not quietly change the formula here.
+   **Resolved at M4 item 1** (finding 1): the formula was wrong, not merely awkward — the
+   conversion is the constant `R/(R−k+1)`, and §2.7 works in k-mer counts and never applies it.
 3. **The L0 graph is not a single path** — 156 unitigs, 222 links, 122 of 312 oriented nodes
    with out-degree > 1, from one 100 kb genome with error-free reads. k = 22 collapses every
    repeat longer than 21 bp, so even the "trivial" rung has branching for M4's terms to
@@ -832,9 +892,11 @@ regenerated at schema version 2. All four gate lines pass at N = 1e5 (`repeat_tw
 **Deferred:** a `prior.py` split (the seed/prior machinery still lives in `exact.py`, which
 `sampler.py` already imported the prior from — revisit if M4 makes that module unwieldy) and
 the `max_bases` story for real graphs, where a unitig can be longer than the budget and
-`run_island` currently raises rather than choosing a policy.
+`run_island` currently raises rather than choosing a policy. *(The budget became optional at
+M4 item 1; the seed guard still raises, deliberately — see that item's finding 3 for why a
+real run wants a budget anyway, and why it has to exceed the longest unitig.)*
 
-### M4 — Likelihood terms, one at a time (4–5 days)
+### M4 — Likelihood terms, one at a time (4–5 days) — *item 1 built, gate failing, rev 12*
 Order, with an ablation after each:
 1. Coverage (§2.7) — should recover the correct branch in an unbalanced bubble.
 2. Single-end congruence (§2.5), phase P1: fixed-alignment scoring against the skiver emission
@@ -852,6 +914,128 @@ Order, with an ablation after each:
 **Gate:** each term individually raises the posterior probability of the ground-truth sequence
 on a two-species synthetic set. If a term doesn't, report it — a term that doesn't help is a
 finding, not a tuning target.
+
+#### M4 item 1 — coverage ⚠️ *(implemented and toy-validated; the L1 gate FAILS, rev 12)*
+
+**Gate status.** The term does exactly what §2.7 asks on a toy graph where the exact posterior
+is available: on the unbalanced bubble it prefers the depth-8 arm over the depth-2 arm by 157:1
+against a prior that is 1:1, and the sampler reproduces the enumerator's target with the term
+on. On **L1 it does not produce a usable posterior at any hazard tested**, and finding 6 says
+why: at a repeat the term *pays* for looping rather than preventing it, so any cycle is a
+runaway. Do not read item 1 as passed, and do not tune the hazard to make it pass — the defect
+is structural, and findings 6 and 3 say where. Item 2 can proceed (it is a per-read term, and
+finding 5 says that is exactly what coverage needs beside it), but **M4's milestone gate is not
+met until the multiplicity question in finding 6 is answered against §2.4.**
+
+**What shipped.** `minoodle/model/coverage.py`: `CoverageTerm`, a per-side Gamma–Poisson with
+§2.7's change hazard; `NoLikelihood` (the prior-only ablation arm); `truth_edges` /
+`true_edge_mass` and an `ablate` subcommand. `index.read_fasta` and `index.reference_walk`
+supply ground truth on a real graph by running a reference's k-mers back through the k-mer
+index — no aligner. `PathGraph.unitig_kmer_cov` was added (finding 1) and `SMCConfig.max_bases`
+became optional, closing M3.5's deferred "what does the budget mean on a real graph" item.
+`datasets/L1.yaml` is the two-species rung the gate needs: Prevotella and a Clostridia contig
+at 10:1, 60 000 reads, assembled with the same container and command as L0.
+
+```bash
+uv run python -m minoodle.simdata run datasets/L1.yaml --out ~/Documents/minoodle_run/L1
+uv run python -m minoodle.model.coverage ablate ~/Documents/minoodle_run/L1 --hazard 0.05 0.2
+```
+
+**Findings.**
+
+1. **The k-mer→base coverage conversion is a constant in the read length, not `L/(L−k+1)`**
+   — this closes M3 finding 2, which deferred the decision to here. On L0 the span-weighted
+   k-mer coverage of the unitigs over 1 kb is **25.73**, and the planted base depth
+   (20 000 × 150 / 100 260 = 29.92) times `(R−k+1)/R` with `R` = 150 is **25.73**, to both
+   decimals. A read of length `R` carries `R−k+1` k-mers over `R` bases; the unitig's own
+   length never enters. The old formula was a factor of 22 out on the shortest unitigs, since
+   L0's median unitig is 32 bp against k = 22. `graph.py` now applies `R/(R−k+1)` with
+   `read_len` as an explicit knob (no assembler records it), and §2.7's term sidesteps the
+   conversion entirely by working in **k-mer counts against a k-mer-span exposure**: a
+   short unitig then carries *little* information rather than wildly overdispersed information,
+   which is the truth about it.
+2. **§2.5's log-odds rule is not specific to term A — term C needs it too.** Scored as a raw
+   `log p(y)`, every unitig charges a large negative number, so the term is a flat toll on
+   extending against a STOP that costs nothing: it stops arguing about *which* branch and
+   starts arguing with the length prior. On L1 the posterior collapsed onto **single-unitig
+   paths** (mean 1.0 unitigs/path) and the ablation had no branch left to score. Scoring the
+   log-odds against the same count under the prior alone — the Bayes factor for "this unitig
+   continues the abundance I have been tracking" — fixes it, and is exactly the correction
+   §2.5 prescribes for reads. Expect to apply it to every remaining term.
+3. **Coverage alone does not terminate, and that defeats the L1 gate.** With the log-odds in
+   place the increment is unbounded *above*: measured on L1 it reaches **+37 nats** for one
+   unitig, because Bayesian evidence scales with exposure and a long unitig matching the
+   running abundance is overwhelming evidence. The geometric stop is `O(ρ)` per base and cannot
+   compete, so on a self-consistent stretch the walk does not stop — §2.8's guarantee holds for
+   the prior alone, not for the prior times this likelihood. Measured on L1 at `max_bases`
+   40 000, `ρ = 1e-3`:
+
+   | arm | `log Ẑ` | island spread | states | unitigs/path |
+   |---|---|---|---|---|
+   | prior only | −0.007 | 0.073 | 2474 | 6.45 |
+   | hazard 0.05 | +46 567 | 21 952 | 694 | 50.7 |
+   | hazard 0.2 | +75 237 | 26 813 | 271 | 8 595 |
+
+   An island spread of 2e4 is not an estimate. **Particle count decides whether you see this:**
+   the same `h = 0.05` arm at 400 particles gave 1.95 unitigs/path and a plausible-looking
+   0.950 → 0.982 improvement in true-branch mass; at 4 000 particles a particle finds the
+   runaway and dominates. Any small-N run of this term will look fine and be wrong — check
+   `unitigs/path` and the island spread, not the branch metric.
+   Not a bug to patch inside the term: item 4 (censored pairs) is the term the plan already
+   nominates to *reduce* spurious long paths, and it is the right place to fix this. The
+   alternative — bounding the per-unitig increment — is a change to the target and needs its
+   own justification, not a constant chosen to make a gate pass.
+   Real-graph runs also need an explicit `max_bases` exceeding the longest unitig (34 860 bp on
+   L1) or the seed guard fires. Both arms run under the same budget, so the comparison is
+   like-for-like as far as it goes.
+4. **The hazard is the load-bearing knob on a real graph, not a nuisance parameter.** It floors
+   the per-unitig penalty at `log h`, so it sets how much local depth inconsistency a path may
+   absorb — and adjacent metaSPAdes unitigs differ in depth by 10× routinely, because a short
+   repeat unitig carries the summed depth of every traversal (§2.7's own caveat, and the
+   reason v0 is local self-consistency only). `hazard = 0.01` is far too aggressive; the
+   ablation sweeps it. But it only moves *where* finding 3 bites, not whether: at 4 000
+   particles `h = 0.05` and `h = 0.2` both run away. There is no hazard that rescues the term
+   on L1, which is why finding 3 is a structural problem and not a calibration one.
+5. **Coverage starves the rare organism.** In both coverage arms the 1× organism gets **no
+   posterior mass at its branch points at all** — nothing to be accurate about. (The prior-only
+   arm does reach it, with 0.026 of mass and all of that on true edges.) Evidence scales with
+   counts, so a high-coverage stretch simply out-scores a low-coverage one; this is §2.5's
+   warning about term A, arriving early and for the same reason, and it is the §3.3 failure
+   mode L1 exists to expose. The honest reading is that coverage on its own is an *abundance*
+   signal, so it needs a per-read term beside it rather than a tuning pass.
+6. **The term does the opposite of preventing looping — it pays for it, and this is the root
+   cause of finding 3.** §2.7's implicit job at a repeat is copy number: a unitig at 2× the
+   flanking depth should be traversed twice, one at 1× once. Measured on `repeat_twice`
+   (unitig 1 is the repeat; posterior over how many times a path traverses it):
+
+   | repeat depth | prior | coverage |
+   |---|---|---|
+   | 1× flanks | mode 1, 0.58 | mode **6**, and 0.53 on ≥ 6 |
+   | 2× flanks | mode 1, 0.58 | **0.89 on zero traversals** |
+   | 4× flanks | mode 1, 0.58 | identical to 2× — no copy-number discrimination at all |
+
+   The mechanism is self-confirmation: the running posterior absorbs the unitig's *own* count
+   on first traversal, so re-scoring the same unitig is a match against evidence it supplied.
+   Successive traversals of one unitig score +1.566, +1.672, +1.720, +1.748, +1.766 nats —
+   each loop is cheaper than the last, without bound. A path that finds any cycle is paid to
+   stay in it, which is exactly the L1 runaway.
+
+   The fix is a multiplicity model, and it collides with the bounded window, so **it is parked
+   in §2.4 as that section's open question** with the three candidate resolutions written out.
+   Decide it there, not here, and not with a constant that bounds the increment.
+   `test_repeat_traversal_is_self_confirming` pins the broken behaviour deliberately: when the
+   fix lands, that test must be rewritten to assert the opposite, and its failure is the signal
+   that it worked.
+7. **`branch_marginals` is not a probability once paths are long.** It accumulates per
+   traversal, so the runaway arms report total branch mass of 2 317 and 9 785 against the
+   prior arm's 1.73. The per-genome fraction is still meaningful as a ratio, but any absolute
+   reading of it is not, and a metric built on it cannot detect the degeneracy that produced
+   it. Read `unitigs/path` and the island spread first — the M5a metric suite (§5.5.3) needs
+   a degeneracy guard of its own, not just accuracy numbers.
+
+**Deliberately not done:** per-base depth from a pileup (the term wants counts, not rates), a
+global abundance deconvolution (v1, §7), and the full run-length change-point posterior — the
+hazard collapse is BOCPD truncated to two atoms, which keeps §2.4's bounded state.
 
 ### M5a — Synthetic ladder and calibration (3–4 days)
 

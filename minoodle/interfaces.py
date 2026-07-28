@@ -103,9 +103,18 @@ class PathGraph(ABC):
 
     @abstractmethod
     def unitig_depth(self, n: OrientedNode) -> np.ndarray:
-        """Per-base depth. Note §5 M3: metaSPAdes `cov`/`KC:i` are k-mer based and must be
-        converted by `L/(L-k+1)` before use, or the §2.7 NegBin mean is systematically wrong.
+        """Per-base depth. metaSPAdes `cov`/`KC:i` are k-mer based and are converted by the
+        constant `R/(R-k+1)` (`R` = read length), not by `L/(L-k+1)` — M4 finding 1.
         """
+
+    def unitig_kmer_cov(self, n: OrientedNode) -> float:
+        """Mean k-mer coverage: the quantity an assembler actually counted.
+
+        §2.7's term works in these units against a `L-k+1` exposure rather than in per-base
+        depth, so no conversion — and no length-dependent overdispersion on short unitigs —
+        enters the likelihood at all (M4 finding 1).
+        """
+        return float(self.unitig_depth(n).mean())
 
     def seeds(self) -> list[Seed]:
         """Every oriented k-mer position (§2.3's `p_seed` support).

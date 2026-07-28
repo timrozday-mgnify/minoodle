@@ -143,6 +143,48 @@ def read_fastq(path: Path) -> Iterator[bytes]:
                 yield line.strip().upper()
 
 
+def read_fasta(path: Path) -> Iterator[bytes]:
+    """Yield one sequence per record from a (optionally gzipped) FASTA."""
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rb") as fh:
+        chunks: list[bytes] = []
+        for line in fh:
+            if line.startswith(b">"):
+                if chunks:
+                    yield b"".join(chunks)
+                chunks = []
+            else:
+                chunks.append(line.strip().upper())
+        if chunks:
+            yield b"".join(chunks)
+
+
+def reference_walk(index: KmerIndex, seq: bytes) -> list[OrientedNode]:
+    """The walk a known sequence takes through the graph — ground truth for M4's ablations.
+
+    Every k-mer of `seq` is looked up in the index and the oriented node it lands on recorded;
+    consecutive duplicates collapse, so the result is the unitig walk. Placements are ignored
+    where the k-mer is absent (an assembly does not have to contain every reference k-mer) or
+    ambiguous (a repeat: the k-mer alone cannot say which traversal this is). The result is
+    therefore a *subset* of the true walk with gaps at repeats, which is the honest ground truth
+    a k-mer index can supply — no aligner, and no claim about the repeats it cannot resolve.
+    """
+    walk: list[OrientedNode] = []
+    for i in range(len(seq) - index.k + 1):
+        kmer = seq[i : i + index.k]
+        rc = revcomp(kmer)
+        forward = kmer <= rc
+        hits = index.table.get(kmer if forward else rc, ())
+        if len(hits) != 1:
+            continue
+        node = decode(hits[0][0])
+        if not forward:
+            node = node.flipped()
+        if not walk or walk[-1] != node:
+            walk.append(node)
+    return walk
+
+
 def fragment_length(index: KmerIndex, a: Anchor, b: Anchor, len_a: int, len_b: int) -> int | None:
     """Outer distance (§2.6) for an FR pair on one unitig, or None if the pair can't say.
 

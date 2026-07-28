@@ -83,7 +83,11 @@ def test_likelihood_is_rc_symmetric(toy):
 
 
 def test_kmer_coverage_converted_to_base_coverage(tmp_path):
-    """§5 M3: `KC:i:` is a k-mer count. Base coverage is `cov_kmer · L/(L-k+1)`."""
+    """`KC:i:` is a k-mer count; base coverage is `cov_kmer · R/(R-k+1)` (M4 finding 1).
+
+    The conversion is a constant in the read length, *not* §5 M3's `L/(L-k+1)`: the unitig's
+    own length never enters, and here it would have been 2.5x out.
+    """
     seq = "ACGT" * 8  # 32 bp, k = 22 -> 11 k-mers
     gfa = tmp_path / "one.gfa"
     gfa.write_text(f"S\t1\t{seq}\tKC:i:220\nS\t2\t{seq}\tDP:f:20\nL\t1\t+\t2\t+\t21M\n")
@@ -93,7 +97,10 @@ def test_kmer_coverage_converted_to_base_coverage(tmp_path):
     gfa.write_text(f"S\t1\t{seq}\tKC:i:220\n")
     g = UnitigGraph.from_gfa(gfa, k=22)
     assert g._kmer_cov[0] == pytest.approx(20.0)  # 220 counts / 11 k-mers
-    assert g.unitig_depth(OrientedNode(0, True))[0] == pytest.approx(20.0 * 32 / 11)
+    assert g.unitig_kmer_cov(OrientedNode(0, True)) == pytest.approx(20.0)
+    assert g.unitig_depth(OrientedNode(0, True))[0] == pytest.approx(20.0 * 150 / 129)
+    short = UnitigGraph.from_gfa(gfa, k=22, read_len=100)
+    assert short.unitig_depth(OrientedNode(0, True))[0] == pytest.approx(20.0 * 100 / 79)
 
 
 def test_k_is_inferred_and_asserted(tmp_path):

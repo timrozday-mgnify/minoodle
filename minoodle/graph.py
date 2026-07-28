@@ -17,8 +17,14 @@ about them:
   both members of most twin pairs explicitly, so edges are deduplicated rather than appended.
   The RC round-trip check (`--k`, `stats`) is the test that this is right.
 - **Coverage units.** metaSPAdes' `KC:i:` tag and the `_cov_` field in a segment name are
-  k-mer counts/coverage, not base coverage. Both are converted here by `L/(L-k+1)`, so
-  `unitig_depth` is in the units §2.7's NegBin expects.
+  k-mer counts/coverage, not base coverage. The conversion to base depth is the **constant**
+  `R/(R-k+1)` in the read length `R`, not the `L/(L-k+1)` §5 M3 specified: a read of length
+  `R` carries `R-k+1` k-mers over `R` bases, and the unitig's own length never enters. Measured
+  on L0 (M4 finding 1): span-weighted k-mer coverage over the unitigs longer than 1 kb is
+  25.73, and the planted base depth of 29.92 times `(150-22+1)/150` is 25.73. The old formula
+  was a factor of 22 out on the shortest unitigs. `read_len` is a knob — it is the *mean* read
+  length of the library, and no assembler records it.
+  §2.7's term does not use this at all; it works in k-mer counts (`unitig_kmer_cov`).
 
 **`k` comes from the GFA, not from the assembler's command line.** `metaspades.py -k 21`
 writes `21M` overlaps: SPAdes' unitigs are paths of (k+1)-mers, so consecutive segments share
@@ -88,18 +94,17 @@ class UnitigGraph(PathGraph):
         seqs: list[bytes],
         edges: list[tuple[int, bool, int, bool]],
         kmer_cov: list[float],
+        read_len: int = 150,
     ):
         self.name = name
         self.k = k
+        self.read_len = read_len
         self._seqs = list(seqs)
         n = len(self._seqs)
         self._kmer_cov = [float(c) for c in kmer_cov]
-        # k-mer coverage -> base coverage (§5 M3). A unitig shorter than k has no k-mers;
-        # metaSPAdes does not emit those, but a hand-written GFA might.
-        self._depths = [
-            c * len(s) / (len(s) - k + 1) if len(s) >= k else c
-            for c, s in zip(self._kmer_cov, self._seqs, strict=True)
-        ]
+        # k-mer coverage -> base coverage: a constant in the read length (M4 finding 1).
+        self._to_base = read_len / (read_len - k + 1) if read_len > k else 1.0
+        self._depths = [c * self._to_base for c in self._kmer_cov]
 
         adj: list[set[int]] = [set() for _ in range(2 * n)]
         for u, ou, v, ov in edges:
@@ -134,13 +139,22 @@ class UnitigGraph(PathGraph):
 
     def unitig_depth(self, n: OrientedNode) -> np.ndarray:
         # ponytail: flat per-base depth, as ToyGraph does — GFA carries one number per segment.
-        # Per-base depth needs a pileup, which is M4's problem if §2.7 turns out to want it.
+        # A real pileup would need the reads; §2.7 works in k-mer counts and does not want one.
         return np.full(len(self._seqs[n.unitig]), self._depths[n.unitig])
+
+    def unitig_kmer_cov(self, n: OrientedNode) -> float:
+        return self._kmer_cov[n.unitig]
 
     # --- I/O -------------------------------------------------------------------------
 
     @classmethod
-    def from_gfa(cls, path: Path, k: int | None = None, name: str | None = None) -> UnitigGraph:
+    def from_gfa(
+        cls,
+        path: Path,
+        k: int | None = None,
+        name: str | None = None,
+        read_len: int = 150,
+    ) -> UnitigGraph:
         """Load a GFA. `k` is inferred from the `L` overlaps; pass it only to assert it."""
         ids: dict[str, int] = {}
         seqs: list[bytes] = []
@@ -179,7 +193,7 @@ class UnitigGraph(PathGraph):
         cov = [_kmer_coverage(sid, tags, len(seq), k) for (sid, tags), seq in
                zip(raw_segs, seqs, strict=True)]
         edges = [(ids[u], ou, ids[v], ov) for u, ou, v, ov, _ in raw_edges]
-        return cls(name or path.stem, k, seqs, edges, cov)
+        return cls(name or path.stem, k, seqs, edges, cov, read_len)
 
     def to_gfa(self, path: Path) -> None:
         """Write this graph as GFA. Used to turn the M1 toy graphs into parser test cases."""
